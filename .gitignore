@@ -1,0 +1,10 @@
+build/
+build*.nosync/
+build-*/
+runs/
+.venv/
+.DS_Store
+__pycache__/
+robot_nav_spec.md
+firmware/robot_fw/wifi_secrets.h
+calib*.txt
