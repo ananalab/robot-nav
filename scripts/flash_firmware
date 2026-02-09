@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Compile le firmware et le téléverse sur la carte, sans l'IDE Arduino.
+#
+#   scripts/flash_firmware                    # port détecté automatiquement
+#   scripts/flash_firmware --port /dev/cu.usbserial-110
+#   scripts/flash_firmware --compile-only     # vérifie juste que ça compile
+#   scripts/flash_firmware --sketch sensor_test  # programme de test des capteurs (firmware/sensor_test)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+[[ -d /opt/homebrew/bin ]] && export PATH="/opt/homebrew/bin:$PATH"
+FQBN="arduino:avr:uno"
+SKETCH="$ROOT/firmware/robot_fw"
+PORT=""
+COMPILE_ONLY=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port) PORT="$2"; shift 2 ;;
+    --compile-only) COMPILE_ONLY=1; shift ;;
+    --sketch) SKETCH="$ROOT/firmware/$2"; shift 2 ;;
+    *) echo "Option inconnue : $1"; exit 1 ;;
+  esac
+done
+
+echo "==> Compilation de $SKETCH pour $FQBN"
+SECRETS="$ROOT/firmware/robot_fw/wifi_secrets.h"
+if [[ "$SKETCH" == *robot_fw && ! -f "$SECRETS" ]]; then
+  cp "$ROOT/firmware/robot_fw/wifi_secrets.example.h" "$SECRETS"
+  echo "Créé $SECRETS : mettez-y le nom et le mot de passe du Wi-Fi (2,4 GHz), puis relancez."
+  exit 1
+fi
+arduino-cli compile --fqbn "$FQBN" --warnings all "$SKETCH"
+[[ $COMPILE_ONLY -eq 1 ]] && exit 0
+
+if [[ -z "$PORT" ]]; then
+  # Premier port USB série trouvé (la carte du kit peut apparaître comme "Unknown"
+  # si elle utilise une puce USB CH340 : c'est normal).
+  PORT="$(arduino-cli board list | awk '{print $1}' | grep -E 'usbserial|usbmodem|wchusb|ttyUSB|ttyACM|^COM[0-9]' | head -1)"
+fi
+if [[ -z "$PORT" ]]; then
+  echo "Aucune carte trouvée. Branchez le câble USB puis relancez, ou donnez --port."
+  exit 1
+fi
+
+echo "==> Téléversement sur $PORT"
+arduino-cli upload --fqbn "$FQBN" --port "$PORT" "$SKETCH"
+echo "Terminé."
