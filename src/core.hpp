@@ -146,3 +146,152 @@ class ConfigNode {
   double getDoubleOr(const std::string& key, double fallback, double min_value,
                      double max_value) const;
 
+  const std::string& file() const { return file_; }
+
+ private:
+  ConfigNode(YAML::Node node, std::string file, std::string path);
+  YAML::Node require(const std::string& key) const;
+  std::string where(const std::string& key) const;
+
+  YAML::Node node_;
+  std::string file_;
+  std::string path_;  // chemin depuis la racine du fichier, ex. "motors.left"
+};
+
+// Paramètres du robot (config/robot.yaml), partagés par sim, control et estimation.
+
+// Modèle d'un moteur (une roue) : vitesse permanente
+//   v_ss(u) = sign(u) * gain * max(0, |u| - deadzone)
+struct MotorParams {
+  double gain = 0.6;      // m/s par unité de commande au-delà de la zone morte
+  double deadzone = 0.35; // u0 : en dessous, la roue ne tourne pas
+};
+
+struct RobotConfig {
+  double wheel_base = 0.13;      // b, entraxe des roues motrices (m)
+  double wheel_diameter = 0.065; // m
+  double robot_radius = 0.10;    // rayon du disque englobant (m)
+  Pose2D marker_offset;          // pose du tag M dans le repère robot R
+  double marker_height = 0.10;   // hauteur du tag au-dessus du sol (m)
+  double marker_size = 0.09;     // côté du tag noir (m)
+  MotorParams left;
+  MotorParams right;
+  double tau = 0.1;              // constante de temps du 1er ordre (s)
+  double delay = 0.05;           // retard de commande d (s)
+};
+
+RobotConfig loadRobotConfig(const ConfigNode& root);
+
+// Vitesse maximale atteignable par une roue (|u| = 1).
+double maxWheelSpeed(const MotorParams& motor);
+
+// Modèle direct (régime permanent) : v = sign(u) * gain * max(0, |u| - deadzone).
+double wheelSpeedFromCommand(const MotorParams& motor, double u);
+
+// Modèle inverse : u = sign(v) * (deadzone + |v| / gain), saturé à [-1, 1] ; v = 0 donne u = 0.
+double commandFromWheelSpeed(const MotorParams& motor, double v);
+
+// Description de l'arène (config/robot.yaml, section arena) : zone de jeu, tags du sol,
+// couleurs et hauteur des obstacles.
+
+// Tag ArUco collé au sol ; (x, y) = centre du tag dans le repère monde W.
+struct FloorTag {
+  int id = 0;
+  double x = 0.0;
+  double y = 0.0;
+};
+
+// Plage HSV d'une couleur d'obstacle (conventions OpenCV : H dans [0, 179]).
+// Si h_min > h_max, la plage fait le tour (cas du rouge : 170..10).
+struct ColorRange {
+  std::string name;
+  int h_min = 0, h_max = 179;
+  int s_min = 0, s_max = 255;
+  int v_min = 0, v_max = 255;
+};
+
+struct ArenaConfig {
+  double x_min = 0.0, y_min = 0.0, x_max = 1.0, y_max = 0.7;  // zone utilisable (m)
+  double floor_tag_size = 0.12;  // côté du carré noir des tags sol (m)
+  std::vector<FloorTag> floor_tags;
+  int robot_tag_id = 10;
+  double obstacle_height = 0.06;  // toutes les boîtes ont la même hauteur (m)
+  std::vector<ColorRange> obstacle_colors;
+};
+
+ArenaConfig loadArenaConfig(const ConfigNode& root);
+
+// Modèle de mouvement du robot, partagé par l'EKF (estimation) et MPPI (control).
+//
+// État x = [x, y, theta, v, omega], entrée u = consigne (v_c, omega_c) :
+//   x     += v cos(theta) dt          y += v sin(theta) dt       theta += omega dt
+//   v     += dt / tau_v (v_c - v)     omega += dt / tau_w (omega_c - omega)
+
+using Vector5d = Eigen::Matrix<double, 5, 1>;
+using Matrix5d = Eigen::Matrix<double, 5, 5>;
+
+// Une étape du modèle.
+Vector5d motionModel(const Vector5d& x, const Twist2D& u, double dt, double tau_v,
+                     double tau_omega);
+// Jacobienne du modèle par rapport à l'état (pour l'EKF).
+Matrix5d motionJacobian(const Vector5d& x, double dt, double tau_v, double tau_omega);
+
+// Chemin planifié, échantillonné tous les ~1 cm, partagé par planning et control.
+
+struct PathPoint {
+  double x = 0.0;
+  double y = 0.0;
+  double theta = 0.0;      // cap de la tangente (rad)
+  double curvature = 0.0;  // dtheta / ds (1/m), positif = virage à gauche
+  double s = 0.0;          // abscisse curviligne depuis le début (m)
+};
+
+struct Path {
+  std::vector<PathPoint> points;
+  std::optional<double> goal_heading;  // cap demandé au but (cliquer-glisser), sinon vide
+
+  bool empty() const { return points.empty(); }
+  double length() const { return points.empty() ? 0.0 : points.back().s; }
+};
+
+// Interfaces matérielles indépendantes d'OpenCV.
+// Seules leurs implémentations changent entre simulation et réel.
+
+// Canal ligne à ligne vers le robot (série USB, UDP, ou firmware simulé).
+class ITransport {
+ public:
+  virtual ~ITransport() = default;
+  // Envoie une ligne (le '\n' final est ajouté par l'implémentation).
+  virtual bool writeLine(std::string_view line) = 0;
+  // Renvoie une ligne complète reçue, sans le '\n', ou rien. Non bloquant.
+  virtual std::optional<std::string> readLine() = 0;
+};
+
+
+// Journaux d'exécution :
+//  - CsvLogger : une ligne de nombres par cycle de contrôle (log.csv) ;
+//  - EventLog  : événements ponctuels (COLLISION, LOST, REPLAN...) dans events.csv.
+
+class CsvLogger {
+ public:
+  // Ouvre (écrase) le fichier et écrit la ligne d'en-tête.
+  CsvLogger(const std::string& path, const std::vector<std::string>& columns);
+  // Écrit une ligne ; lève std::invalid_argument si le nombre de valeurs est faux.
+  void log(const std::vector<double>& values);
+
+ private:
+  std::ofstream out_;
+  std::size_t num_columns_;
+};
+
+class EventLog {
+ public:
+  explicit EventLog(const std::string& path);
+  void log(Time t, const std::string& type, const std::string& message);
+
+ private:
+  std::ofstream out_;
+};
+
+// Crée et renvoie le dossier <base>/AAAAMMJJ_HHMMSS (heure locale).
+std::string makeRunDirectory(const std::string& base = "runs");
