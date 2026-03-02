@@ -177,3 +177,183 @@ std::vector<double> ConfigNode::getDoubleList(const std::string& key,
   const YAML::Node seq = require(key);
   if (!seq.IsSequence()) {
     throw ConfigError(where(key) + " : une liste de nombres est attendue");
+  }
+  if (expected_size != 0 && seq.size() != expected_size) {
+    throw ConfigError(where(key) + " : " + std::to_string(expected_size) +
+                      " valeurs attendues, " + std::to_string(seq.size()) + " trouvées");
+  }
+  std::vector<double> values;
+  try {
+    for (const auto& item : seq) {
+      values.push_back(item.as<double>());
+    }
+  } catch (const YAML::Exception&) {
+    throw ConfigError(where(key) + " : la liste ne doit contenir que des nombres");
+  }
+  return values;
+}
+
+double ConfigNode::getDoubleOr(const std::string& key, double fallback, double min_value,
+                               double max_value) const {
+  return has(key) ? getDouble(key, min_value, max_value) : fallback;
+}
+
+namespace {
+MotorParams loadMotor(const ConfigNode& node) {
+  MotorParams m;
+  m.gain = node.getDouble("gain", 0.05, 3.0);
+  m.deadzone = node.getDouble("deadzone", 0.0, 0.9);
+  return m;
+}
+}  // namespace
+
+RobotConfig loadRobotConfig(const ConfigNode& root) {
+  RobotConfig cfg;
+  const ConfigNode geo = root.child("geometry");
+  cfg.wheel_base = geo.getDouble("wheel_base", 0.05, 0.5);
+  cfg.wheel_diameter = geo.getDouble("wheel_diameter", 0.02, 0.2);
+  cfg.robot_radius = geo.getDouble("robot_radius", 0.03, 0.5);
+  const auto offset = geo.getDoubleList("marker_offset", 3);
+  cfg.marker_offset = {offset[0], offset[1], degToRad(offset[2])};
+  cfg.marker_height = geo.getDouble("marker_height", 0.0, 0.5);
+  cfg.marker_size = geo.getDouble("marker_size", 0.02, 0.3);
+
+  const ConfigNode motors = root.child("motors");
+  cfg.left = loadMotor(motors.child("left"));
+  cfg.right = loadMotor(motors.child("right"));
+  cfg.tau = motors.getDouble("tau", 0.005, 1.0);
+  cfg.delay = motors.getDouble("delay", 0.0, 0.5);
+  return cfg;
+}
+
+double maxWheelSpeed(const MotorParams& motor) { return motor.gain * (1.0 - motor.deadzone); }
+
+double wheelSpeedFromCommand(const MotorParams& motor, double u) {
+  const double magnitude = motor.gain * std::max(0.0, std::abs(u) - motor.deadzone);
+  return u >= 0.0 ? magnitude : -magnitude;
+}
+
+double commandFromWheelSpeed(const MotorParams& motor, double v) {
+  if (v == 0.0) {
+    return 0.0;
+  }
+  const double magnitude = std::min(1.0, motor.deadzone + std::abs(v) / motor.gain);
+  return v > 0.0 ? magnitude : -magnitude;
+}
+
+ArenaConfig loadArenaConfig(const ConfigNode& root) {
+  ArenaConfig cfg;
+  const auto bounds = root.getDoubleList("bounds", 4);
+  cfg.x_min = bounds[0];
+  cfg.y_min = bounds[1];
+  cfg.x_max = bounds[2];
+  cfg.y_max = bounds[3];
+  if (cfg.x_max - cfg.x_min < 0.2 || cfg.y_max - cfg.y_min < 0.2) {
+    throw ConfigError(root.file() + ": bounds : la zone doit faire au moins 20 cm de côté");
+  }
+  cfg.floor_tag_size = root.getDouble("floor_tag_size", 0.02, 0.5);
+  for (const ConfigNode& tag : root.list("floor_tags")) {
+    cfg.floor_tags.push_back({tag.getInt("id", 0, 49), tag.getDouble("x", -10.0, 10.0),
+                              tag.getDouble("y", -10.0, 10.0)});
+  }
+  if (cfg.floor_tags.size() < 2) {
+    throw ConfigError(root.file() + ": floor_tags : au moins 2 tags sol sont nécessaires");
+  }
+  cfg.robot_tag_id = root.getInt("robot_tag_id", 0, 49);
+  cfg.obstacle_height = root.getDouble("obstacle_height", 0.0, 0.5);
+  for (const ConfigNode& c : root.list("obstacle_colors")) {
+    ColorRange range;
+    range.name = c.getString("name");
+    const auto h = c.getDoubleList("h", 2);
+    const auto s = c.getDoubleList("s", 2);
+    const auto v = c.getDoubleList("v", 2);
+    range.h_min = static_cast<int>(h[0]);
+    range.h_max = static_cast<int>(h[1]);
+    range.s_min = static_cast<int>(s[0]);
+    range.s_max = static_cast<int>(s[1]);
+    range.v_min = static_cast<int>(v[0]);
+    range.v_max = static_cast<int>(v[1]);
+    cfg.obstacle_colors.push_back(range);
+  }
+  return cfg;
+}
+
+Vector5d motionModel(const Vector5d& x, const Twist2D& u, double dt, double tau_v,
+                     double tau_omega) {
+  Vector5d n = x;
+  n(0) += x(3) * std::cos(x(2)) * dt;
+  n(1) += x(3) * std::sin(x(2)) * dt;
+  n(2) = wrapAngle(x(2) + x(4) * dt);
+  n(3) += dt / tau_v * (u.v - x(3));
+  n(4) += dt / tau_omega * (u.omega - x(4));
+  return n;
+}
+
+Matrix5d motionJacobian(const Vector5d& x, double dt, double tau_v, double tau_omega) {
+  // Dérivées partielles du modèle par rapport à l'état.
+  Matrix5d F = Matrix5d::Identity();
+  F(0, 2) = -x(3) * std::sin(x(2)) * dt;
+  F(0, 3) = std::cos(x(2)) * dt;
+  F(1, 2) = x(3) * std::cos(x(2)) * dt;
+  F(1, 3) = std::sin(x(2)) * dt;
+  F(2, 4) = dt;
+  F(3, 3) = 1.0 - dt / tau_v;
+  F(4, 4) = 1.0 - dt / tau_omega;
+  return F;
+}
+
+CsvLogger::CsvLogger(const std::string& path, const std::vector<std::string>& columns)
+    : out_(path), num_columns_(columns.size()) {
+  if (!out_) {
+    throw std::runtime_error("impossible de créer " + path);
+  }
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    out_ << (i == 0 ? "" : ",") << columns[i];
+  }
+  out_ << '\n';
+  out_ << std::setprecision(9);
+}
+
+void CsvLogger::log(const std::vector<double>& values) {
+  if (values.size() != num_columns_) {
+    throw std::invalid_argument("CsvLogger : " + std::to_string(values.size()) +
+                                " valeurs pour " + std::to_string(num_columns_) + " colonnes");
+  }
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    out_ << (i == 0 ? "" : ",") << values[i];
+  }
+  out_ << '\n';
+}
+
+EventLog::EventLog(const std::string& path) : out_(path) {
+  if (!out_) {
+    throw std::runtime_error("impossible de créer " + path);
+  }
+  out_ << "t,type,message\n";
+}
+
+void EventLog::log(Time t, const std::string& type, const std::string& message) {
+  out_ << t << ',' << type << ",\"" << message << "\"\n";
+  out_.flush();  // les événements sont rares : on les veut sur disque même en cas de crash
+}
+
+std::string makeRunDirectory(const std::string& base) {
+  // Nom du dossier = date et heure locales : c'est un nom de fichier, pas une
+  // donnée d'algorithme, donc l'horloge murale est permise ici.
+  const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+  std::tm local{};
+#ifdef _WIN32
+  localtime_s(&local, &now);
+#else
+  localtime_r(&now, &local);
+#endif
+  std::ostringstream name;
+  name << std::put_time(&local, "%Y%m%d_%H%M%S");
+  std::filesystem::path dir = std::filesystem::path(base) / name.str();
+  // Deux exécutions dans la même seconde : on ajoute un suffixe.
+  for (int i = 1; std::filesystem::exists(dir); ++i) {
+    dir = std::filesystem::path(base) / (name.str() + "_" + std::to_string(i));
+  }
+  std::filesystem::create_directories(dir);
+  return dir.string();
+}
