@@ -162,3 +162,126 @@ class ArenaCalibrator {
   std::vector<cv::Point2f> image_points_;
   std::vector<int> ids_seen_;
   int frames_used_ = 0;
+};
+
+// RobotLocalizer : pose du robot à partir du tag 10 posé sur son toit.
+//
+// Méthode A (par défaut) : coins du tag -> rayons -> intersection avec le plan
+// z = h_marker -> 4 points du monde -> ajustement rigide 2D (Kabsch) -> pose du tag
+// -> pose du robot (en retirant l'offset du tag). Le résidu de l'ajustement mesure la
+// qualité de la détection et augmente la covariance.
+// Méthode B : solvePnP IPPE_SQUARE (pose 3D du tag), gardée pour comparaison.
+
+enum class LocalizerMethod { RayPlane, Pnp };  // A, B
+
+struct LocalizerConfig {
+  int tag_id = 10;
+  double marker_size = 0.09;
+  double marker_height = 0.10;
+  Pose2D marker_offset;      // pose du tag dans le repère robot
+  LocalizerMethod method = LocalizerMethod::RayPlane;
+  double size_tolerance = 0.10;    // rejet si la taille reconstruite s'écarte de plus de 10 %
+  double sigma_xy = 0.003;         // écart-type de base de la position (m)
+  double sigma_theta = 0.017;      // écart-type de base du cap (rad)
+  double residual_scale = 0.002;   // résidu (m) qui double l'écart-type
+};
+
+LocalizerConfig loadLocalizerConfig(const ConfigNode& section,
+                                    const RobotConfig& robot, int tag_id);
+
+struct Localization {
+  bool ok = false;
+  std::string reject_reason;
+  PoseMeasurement measurement;  // pose du ROBOT (pas du tag)
+  Pose2D tag_pose;
+  double residual = 0.0;              // RMS de l'ajustement (m)
+  double reconstructed_size = 0.0;    // côté moyen reconstruit (m)
+  std::array<cv::Point2f, 4> corners{};
+};
+
+// Ajustement rigide 2D par moindres carrés : (theta, t) minimisant
+// sum |R(theta) model_i + t - world_i|^2. Renvoie le résidu RMS.
+double kabsch2D(const std::vector<Eigen::Vector2d>& model, const std::vector<Eigen::Vector2d>& world,
+                Pose2D& pose);
+
+class RobotLocalizer {
+ public:
+  explicit RobotLocalizer(const LocalizerConfig& config);
+
+  // Cherche le tag robot parmi les détections. stamp = instant de capture.
+  Localization localize(const std::vector<MarkerDetection>& detections, const CameraModel& camera,
+                        Time stamp) const;
+
+ private:
+  Localization fromCorners(const MarkerDetection& d, const CameraModel& camera) const;
+  bool tagPoseRayPlane(const MarkerDetection& d, const CameraModel& camera, Localization& out) const;
+  bool tagPosePnp(const MarkerDetection& d, const CameraModel& camera, Localization& out) const;
+
+  LocalizerConfig config_;
+};
+
+// ObstacleDetector : boîtes de couleur vive -> grille d'occupation.
+//
+// 1) seuillage HSV, ouverture puis fermeture morphologiques, contours assez grands ;
+// 2) on masque le robot et les tags sol ;
+// 3) chaque contour est projeté sur le plan du dessus des boîtes (z = h) ET sur le sol
+//    (z = 0). Vu d'en haut en biais, une boîte montre son dessus et ses flancs côté caméra :
+//    - projeté sur z = h, le flanc déborde du côté de la caméra ;
+//    - projeté sur z = 0, le dessus déborde du côté opposé.
+//    L'intersection des deux projections redonne l'empreinte réelle de la boîte.
+// 4) mode statique : vote majoritaire sur N images.
+
+struct ObstacleDetectorConfig {
+  int morph_kernel = 5;        // taille du noyau morphologique (px)
+  double min_area_px = 150.0;  // contours plus petits ignorés (bruit)
+  int frames = 20;             // images accumulées en mode statique
+  double robot_mask_radius = 0.13;  // disque masqué autour du robot (m)
+};
+
+ObstacleDetectorConfig loadObstacleDetectorConfig(const ConfigNode& section);
+
+class ObstacleDetector {
+ public:
+  ObstacleDetector(const ObstacleDetectorConfig& config, const ArenaConfig& arena,
+                   double resolution);
+
+  // Masque binaire (255 = couleur d'obstacle), après morphologie.
+  cv::Mat colorMask(const cv::Mat& bgr) const;
+  // Grille d'occupation d'une seule image (cellules hors arène occupées).
+  OccupancyGrid detect(const cv::Mat& bgr, const CameraModel& camera,
+                                 const std::optional<Pose2D>& robot,
+                                 double robot_marker_height) const;
+
+  // Mode statique : accumulation puis vote majoritaire.
+  void startAccumulation();
+  void addFrame(const cv::Mat& bgr, const CameraModel& camera,
+                const std::optional<Pose2D>& robot, double robot_marker_height);
+  bool ready() const { return frames_added_ >= config_.frames; }
+  OccupancyGrid result() const;
+
+ private:
+  void maskRobotAndTags(cv::Mat& mask, const CameraModel& camera,
+                        const std::optional<Pose2D>& robot, double robot_height) const;
+
+  ObstacleDetectorConfig config_;
+  ArenaConfig arena_;
+  double resolution_;
+  std::vector<int> votes_;
+  int frames_added_ = 0;
+};
+
+// Intersection sur union des cellules occupées DANS l'arène (comparaison à la vérité terrain).
+double occupancyIoU(const OccupancyGrid& a, const OccupancyGrid& b,
+                    const ArenaConfig& arena);
+
+// Vraie caméra (iPhone par Caméra de continuité, appli webcam, ou flux réseau MJPEG/RTSP).
+//
+// Un thread de capture lit les images en continu et ne garde que la DERNIÈRE : sinon les
+// images s'accumulent dans le tampon d'OpenCV et la latence augmente sans fin.
+// Horodatage : instant de réception - latence mesurée (outil camera_tool latency).
+
+class OpenCvCamera : public ICamera {
+ public:
+  // source : "0", "1"... (index) ou URL. Lève si la caméra ne s'ouvre pas.
+  OpenCvCamera(const std::string& source, int width, int height, double latency,
+               const IClock& clock);
