@@ -285,3 +285,126 @@ class OpenCvCamera : public ICamera {
   // source : "0", "1"... (index) ou URL. Lève si la caméra ne s'ouvre pas.
   OpenCvCamera(const std::string& source, int width, int height, double latency,
                const IClock& clock);
+  ~OpenCvCamera() override;
+  OpenCvCamera(const OpenCvCamera&) = delete;
+  OpenCvCamera& operator=(const OpenCvCamera&) = delete;
+
+  std::optional<Frame> grab() override;
+  // Images reçues par seconde (moyenne glissante).
+  double fps() const { return fps_.load(); }
+
+ private:
+  void captureLoop();
+
+  cv::VideoCapture capture_;
+  double latency_;
+  const IClock& clock_;
+  std::thread thread_;
+  std::atomic<bool> running_{true};
+  std::atomic<double> fps_{0.0};
+  std::mutex mutex_;          // protège latest_ et fresh_ (partagés avec le thread)
+  Frame latest_;
+  bool fresh_ = false;
+};
+
+// Calibration des intrinsèques (K + distorsion) avec un plateau ChArUco.
+// Un plateau ChArUco = damier dont les cases blanches portent des tags ArUco : chaque coin
+// du damier est identifié même si le plateau n'est vu qu'en partie.
+
+struct CharucoSpec {
+  int squares_x = 5, squares_y = 7;
+  double square = 0.035;  // m
+  double marker = 0.026;  // m
+};
+
+// Lit la section "charuco" ; square_mm_override > 0 remplace la taille des cases (mode écran).
+CharucoSpec loadCharucoSpec(const ConfigNode& section, double square_mm_override = 0.0);
+cv::aruco::CharucoBoard makeBoard(const CharucoSpec& spec);
+
+class CameraCalibrator {
+ public:
+  explicit CameraCalibrator(const CharucoSpec& spec);
+
+  // Coins ChArUco détectés dans l'image (pour l'affichage).
+  std::vector<cv::Point2f> detectCorners(const cv::Mat& image) const;
+  // Ajoute une vue si assez de coins sont visibles (>= 8). Renvoie true si ajoutée.
+  bool addView(const cv::Mat& image);
+  int views() const { return static_cast<int>(object_points_.size()); }
+  // Calibre ; renvoie l'erreur de reprojection RMS (px), ou -1 si pas assez de vues.
+  double calibrate(CameraIntrinsics& out) const;
+
+ private:
+  cv::aruco::CharucoBoard board_;
+  cv::aruco::CharucoDetector detector_;
+  std::vector<std::vector<cv::Point3f>> object_points_;
+  std::vector<std::vector<cv::Point2f>> image_points_;
+  cv::Size image_size_;
+};
+
+// Caméra simulée : rendu synthétique de l'arène vue d'en haut.
+//
+// Rendu : sol gris texturé + tags sol (une homographie du plan z = 0), boîtes 3D
+// (algorithme du peintre), robot (châssis sombre + toit blanc avec le tag 10),
+// distorsion k1, flou, bruit, exposition variable. Les images sont livrées après
+// "latency" secondes ; certaines sont perdues ou ont le tag robot masqué.
+
+struct SimCameraConfig {
+  CameraIntrinsics intrinsics;
+  Eigen::Vector3d position{0.5, 0.35, 1.2};  // centre optique dans le monde (m)
+  double tilt = 0.0;                         // inclinaison (rad)
+  double yaw = 0.0;                          // (rad)
+  double fps = 30.0;
+  double latency = 0.15;                     // s
+  double p_drop = 0.0;                       // probabilité d'image perdue
+  double p_occlusion = 0.0;                  // probabilité de tag robot masqué
+  double blur_sigma = 0.0;                   // flou gaussien (px)
+  double noise_sigma = 0.0;                  // bruit pixel (niveaux de gris)
+  double exposure_sigma = 0.0;               // variation relative d'exposition
+  double chassis_length = 0.15, chassis_width = 0.11;  // boîte sombre du châssis (m)
+  double roof_size = 0.11;                   // carton blanc portant le tag (m)
+  std::vector<std::pair<std::string, cv::Scalar>> colors;  // couleur BGR de chaque obstacle
+};
+
+SimCameraConfig loadSimCameraConfig(const ConfigNode& camera_section);
+
+class SimCamera : public ICamera {
+ public:
+  SimCamera(const SimCameraConfig& config, const RobotConfig& robot,
+            const ArenaConfig& arena, const SimWorld& world, const IClock& clock,
+            unsigned seed);
+
+  // Rend l'état actuel du monde, horodaté t ; l'image sera livrée à t + latency.
+  void capture(Time t);
+  // Dernière image livrée depuis le dernier appel (selon l'horloge).
+  std::optional<Frame> grab() override;
+
+  // Rendu sans dégradation ni latence (tests, affichage).
+  cv::Mat render(bool show_robot_tag = true) const;
+  // Le vrai modèle de caméra (extrinsèques exactes) : sert de vérité terrain.
+  const CameraModel& trueModel() const { return model_; }
+
+ private:
+  void buildFloorTexture();
+  void buildDistortionMaps();
+  void drawBox(cv::Mat& img, const Box& box, const cv::Scalar& color) const;
+  void warpPlaneTexture(cv::Mat& img, const cv::Mat& texture, const cv::Matx33d& tex_to_world,
+                        double h) const;
+  cv::Point2f projectIdeal(const Eigen::Vector3d& p) const;
+  cv::Matx33d planeHomography(double h) const;
+  cv::Scalar colorOf(const std::string& name) const;
+  void degrade(cv::Mat& img);
+
+  SimCameraConfig config_;
+  RobotConfig robot_;
+  ArenaConfig arena_;
+  const SimWorld& world_;
+  const IClock& clock_;
+  std::mt19937 rng_;
+  CameraModel model_;
+  Eigen::Matrix3d R_;  // monde -> caméra
+  Eigen::Vector3d t_;
+  cv::Mat floor_texture_, robot_texture_;
+  cv::Matx33d floor_to_world_;  // pixel de texture -> (x, y, 1) monde
+  cv::Mat map_x_, map_y_;       // pour appliquer la distorsion
+  std::deque<Frame> pending_;
+};

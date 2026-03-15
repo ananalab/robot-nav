@@ -273,3 +273,232 @@ double ArenaCalibrator::reprojectionError(const cv::Mat& image, const cv::Vec3d&
 
 LocalizerConfig loadLocalizerConfig(const ConfigNode& section,
                                     const RobotConfig& robot, int tag_id) {
+  LocalizerConfig cfg;
+  cfg.tag_id = tag_id;
+  cfg.marker_size = robot.marker_size;
+  cfg.marker_height = robot.marker_height;
+  cfg.marker_offset = robot.marker_offset;
+  const std::string method = section.getString("method");
+  if (method != "A" && method != "B") {
+    throw ConfigError(section.file() + ": localizer.method : A ou B attendu");
+  }
+  cfg.method = method == "A" ? LocalizerMethod::RayPlane : LocalizerMethod::Pnp;
+  cfg.size_tolerance = section.getDouble("size_tolerance", 0.01, 0.5);
+  cfg.sigma_xy = section.getDouble("sigma_xy", 1e-4, 0.1);
+  cfg.sigma_theta = degToRad(section.getDouble("sigma_theta_deg", 0.01, 20.0));
+  cfg.residual_scale = section.getDouble("residual_scale", 1e-4, 0.1);
+  return cfg;
+}
+
+double kabsch2D(const std::vector<Eigen::Vector2d>& model, const std::vector<Eigen::Vector2d>& world,
+                Pose2D& pose) {
+  // 1) On centre les deux nuages de points.
+  const std::size_t n = model.size();
+  Eigen::Vector2d mean_m = Eigen::Vector2d::Zero(), mean_w = Eigen::Vector2d::Zero();
+  for (std::size_t i = 0; i < n; ++i) {
+    mean_m += model[i] / static_cast<double>(n);
+    mean_w += world[i] / static_cast<double>(n);
+  }
+  // 2) L'angle optimal est theta = atan2(sum m' x w', sum m' . w').
+  double sum_cross = 0.0, sum_dot = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const Eigen::Vector2d m = model[i] - mean_m;
+    const Eigen::Vector2d w = world[i] - mean_w;
+    sum_cross += m.x() * w.y() - m.y() * w.x();
+    sum_dot += m.dot(w);
+  }
+  const double theta = std::atan2(sum_cross, sum_dot);
+  // 3) Translation : t = moyenne_w - R(theta) moyenne_m.
+  const Pose2D rotation{0.0, 0.0, theta};
+  const Eigen::Vector2d rotated_mean = transformPoint(rotation, mean_m);
+  pose = {mean_w.x() - rotated_mean.x(), mean_w.y() - rotated_mean.y(), theta};
+  // Résidu RMS.
+  double sum2 = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    sum2 += (transformPoint(pose, model[i]) - world[i]).squaredNorm();
+  }
+  return std::sqrt(sum2 / static_cast<double>(n));
+}
+
+RobotLocalizer::RobotLocalizer(const LocalizerConfig& config) : config_(config) {}
+
+bool RobotLocalizer::tagPoseRayPlane(const MarkerDetection& d, const CameraModel& camera,
+                                     Localization& out) const {
+  const std::vector<cv::Point2f> pixels(d.corners.begin(), d.corners.end());
+  const std::vector<Eigen::Vector2d> world = camera.intersectPlane(pixels, config_.marker_height);
+  const auto local = markerCorners({0.0, 0.0, 0.0}, config_.marker_size);
+  const std::vector<Eigen::Vector2d> model(local.begin(), local.end());
+  out.residual = kabsch2D(model, world, out.tag_pose);
+  double perimeter = 0.0;
+  for (int k = 0; k < 4; ++k) perimeter += (world[(k + 1) % 4] - world[k]).norm();
+  out.reconstructed_size = perimeter / 4.0;
+  return true;
+}
+
+bool RobotLocalizer::tagPosePnp(const MarkerDetection& d, const CameraModel& camera,
+                                Localization& out) const {
+  // Coins dans le repère OpenCV du tag (x à droite, y en haut), ordre exigé par IPPE_SQUARE.
+  const float h = static_cast<float>(config_.marker_size / 2.0);
+  const std::vector<cv::Point3f> object{{-h, h, 0}, {h, h, 0}, {h, -h, 0}, {-h, -h, 0}};
+  const std::vector<cv::Point2f> pixels(d.corners.begin(), d.corners.end());
+  cv::Vec3d rvec_cm, tvec_cm;
+  if (!cv::solvePnP(object, pixels, camera.intrinsics().K, camera.intrinsics().distortion, rvec_cm,
+                    tvec_cm, false, cv::SOLVEPNP_IPPE_SQUARE)) {
+    return false;
+  }
+  // T_wm = T_wc * T_cm, avec T_wc = inverse(R_cw, t_cw).
+  cv::Matx33d r_cw, r_cm;
+  cv::Rodrigues(camera.rvec(), r_cw);
+  cv::Rodrigues(rvec_cm, r_cm);
+  const cv::Matx33d r_wm = r_cw.t() * r_cm;
+  const cv::Vec3d t_wm = r_cw.t() * (tvec_cm - camera.tvec());
+  // Le x de notre repère M est le +y du repère OpenCV du tag (le haut du tag).
+  const cv::Vec3d up = r_wm * cv::Vec3d(0, 1, 0);
+  out.tag_pose = {t_wm[0], t_wm[1], std::atan2(up[1], up[0])};
+  out.residual = 0.0;
+  out.reconstructed_size = config_.marker_size;
+  // Contrôle de cohérence : le tag doit être à la bonne hauteur.
+  return std::abs(t_wm[2] - config_.marker_height) < 0.03;
+}
+
+Localization RobotLocalizer::fromCorners(const MarkerDetection& d, const CameraModel& camera) const {
+  Localization out;
+  out.corners = d.corners;
+  const bool ok = config_.method == LocalizerMethod::RayPlane ? tagPoseRayPlane(d, camera, out)
+                                                               : tagPosePnp(d, camera, out);
+  if (!ok) {
+    out.reject_reason = "pose du tag incohérente";
+    return out;
+  }
+  if (std::abs(out.reconstructed_size - config_.marker_size) > config_.size_tolerance * config_.marker_size) {
+    out.reject_reason = "taille du tag incohérente";
+    return out;
+  }
+  // Pose du robot : T_WR = T_WM * inverse(T_RM).
+  out.measurement.pose = compose(out.tag_pose, inverse(config_.marker_offset));
+  // Plus le résidu est grand, moins on fait confiance à la mesure.
+  const double scale = 1.0 + out.residual / config_.residual_scale;
+  const double sxy = config_.sigma_xy * scale;
+  const double sth = config_.sigma_theta * scale;
+  out.measurement.cov = Eigen::Vector3d(sxy * sxy, sxy * sxy, sth * sth).asDiagonal();
+  out.ok = true;
+  return out;
+}
+
+Localization RobotLocalizer::localize(const std::vector<MarkerDetection>& detections,
+                                      const CameraModel& camera, Time stamp) const {
+  for (const MarkerDetection& d : detections) {
+    if (d.id == config_.tag_id) {
+      Localization loc = fromCorners(d, camera);
+      loc.measurement.stamp = stamp;
+      return loc;
+    }
+  }
+  Localization none;
+  none.reject_reason = "tag robot non vu";
+  return none;
+}
+
+ObstacleDetectorConfig loadObstacleDetectorConfig(const ConfigNode& section) {
+  ObstacleDetectorConfig cfg;
+  cfg.morph_kernel = section.getInt("morph_kernel", 1, 51);
+  cfg.min_area_px = section.getDouble("min_area_px", 0.0, 1e6);
+  cfg.frames = section.getInt("frames", 1, 1000);
+  cfg.robot_mask_radius = section.getDouble("robot_mask_radius", 0.0, 1.0);
+  return cfg;
+}
+
+ObstacleDetector::ObstacleDetector(const ObstacleDetectorConfig& config,
+                                   const ArenaConfig& arena, double resolution)
+    : config_(config), arena_(arena), resolution_(resolution) {}
+
+cv::Mat ObstacleDetector::colorMask(const cv::Mat& bgr) const {
+  cv::Mat hsv;
+  cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
+  cv::Mat mask = cv::Mat::zeros(bgr.size(), CV_8UC1);
+  for (const ColorRange& c : arena_.obstacle_colors) {
+    cv::Mat part;
+    if (c.h_min <= c.h_max) {
+      cv::inRange(hsv, cv::Scalar(c.h_min, c.s_min, c.v_min), cv::Scalar(c.h_max, c.s_max, c.v_max), part);
+    } else {
+      // Teinte qui fait le tour (rouge) : [h_min, 179] ou [0, h_max].
+      cv::Mat low, high;
+      cv::inRange(hsv, cv::Scalar(c.h_min, c.s_min, c.v_min), cv::Scalar(179, c.s_max, c.v_max), high);
+      cv::inRange(hsv, cv::Scalar(0, c.s_min, c.v_min), cv::Scalar(c.h_max, c.s_max, c.v_max), low);
+      part = low | high;
+    }
+    mask |= part;
+  }
+  // Ouverture (enlève les petits points isolés) puis fermeture (bouche les petits trous).
+  const cv::Mat kernel = cv::getStructuringElement(
+      cv::MORPH_ELLIPSE, cv::Size(config_.morph_kernel, config_.morph_kernel));
+  cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
+  cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+  return mask;
+}
+
+void ObstacleDetector::maskRobotAndTags(cv::Mat& mask, const CameraModel& camera,
+                                        const std::optional<Pose2D>& robot,
+                                        double robot_height) const {
+  if (robot) {
+    // Disque autour du robot, projeté au sol et à la hauteur du toit : on efface l'enveloppe.
+    std::vector<cv::Point3f> pts;
+    for (int k = 0; k < 24; ++k) {
+      const double a = 2.0 * kPi * k / 24;
+      const float x = static_cast<float>(robot->x + config_.robot_mask_radius * std::cos(a));
+      const float y = static_cast<float>(robot->y + config_.robot_mask_radius * std::sin(a));
+      pts.emplace_back(x, y, 0.0f);
+      pts.emplace_back(x, y, static_cast<float>(robot_height));
+    }
+    std::vector<cv::Point2f> px = camera.project(pts);
+    std::vector<cv::Point> hull_in(px.begin(), px.end()), hull;
+    cv::convexHull(hull_in, hull);
+    cv::fillConvexPoly(mask, hull, cv::Scalar(0));
+  }
+  for (const FloorTag& tag : arena_.floor_tags) {
+    const auto corners = markerCorners(floorTagPose(tag), arena_.floor_tag_size * 8.0 / 6.0);
+    std::vector<cv::Point3f> pts;
+    for (const auto& c : corners) pts.emplace_back(static_cast<float>(c.x()), static_cast<float>(c.y()), 0.0f);
+    const std::vector<cv::Point2f> px = camera.project(pts);
+    const std::vector<cv::Point> poly(px.begin(), px.end());
+    cv::fillConvexPoly(mask, poly, cv::Scalar(0));
+  }
+}
+
+OccupancyGrid ObstacleDetector::detect(const cv::Mat& bgr, const CameraModel& camera,
+                                       const std::optional<Pose2D>& robot,
+                                       double robot_marker_height) const {
+  cv::Mat mask = colorMask(bgr);
+  maskRobotAndTags(mask, camera, robot, robot_marker_height);
+  std::vector<std::vector<cv::Point>> contours;
+  cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+  OccupancyGrid grid = makeArenaGrid(arena_, resolution_);
+  for (const auto& contour : contours) {
+    if (cv::contourArea(contour) < config_.min_area_px) continue;
+    const std::vector<cv::Point2f> pixels(contour.begin(), contour.end());
+    // Projections sur le dessus (z = h) et sur le sol (z = 0) ; on garde l'intersection.
+    OccupancyGrid top(grid.xMin(), grid.yMin(), grid.cols(), grid.rows(), resolution_);
+    OccupancyGrid floor(grid.xMin(), grid.yMin(), grid.cols(), grid.rows(), resolution_);
+    top.fillPolygon(camera.intersectPlane(pixels, arena_.obstacle_height));
+    floor.fillPolygon(camera.intersectPlane(pixels, 0.0));
+    for (int i = 0; i < grid.cols() * grid.rows(); ++i) {
+      const GridIndex c = grid.fromLinear(i);
+      if (top.at(c) == CellState::Occupied && floor.at(c) == CellState::Occupied) {
+        grid.set(c, CellState::Occupied);
+      }
+    }
+  }
+  return grid;
+}
+
+void ObstacleDetector::startAccumulation() {
+  votes_.clear();
+  frames_added_ = 0;
+}
+
+void ObstacleDetector::addFrame(const cv::Mat& bgr, const CameraModel& camera,
+                                const std::optional<Pose2D>& robot,
+                                double robot_marker_height) {
+  const OccupancyGrid g = detect(bgr, camera, robot, robot_marker_height);
+  if (votes_.empty()) votes_.assign(g.cols() * g.rows(), 0);
