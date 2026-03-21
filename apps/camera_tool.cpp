@@ -242,3 +242,248 @@ int cmdMarkers(int argc, char** argv) {
       md << drawingInstructions(arena.robot_tag_id, robot.marker_size * 1000 / 6,
                                 out_dir + "/dessin_tag_" + std::to_string(arena.robot_tag_id) + ".png");
       std::cout << "Mode dessin : " << out_dir << "/tags_a_dessiner.md\n";
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "Erreur : " << e.what() << "\n";
+    return 1;
+  }
+  return 0;
+}
+
+
+// calibration des intrinsèques
+int cmdCalib(int argc, char** argv) {
+  try {
+    std::string config_dir = "config", source;
+    bool screen = false;
+    double square_mm = 0.0;
+    int wanted_views = 20;
+    for (int i = 1; i < argc; ++i) {
+      const std::string a = argv[i];
+      auto next = [&]() -> std::string {
+        if (i + 1 >= argc) throw std::runtime_error("valeur manquante après " + a);
+        return argv[++i];
+      };
+      if (a == "--screen") screen = true;
+      else if (a == "--square-mm") square_mm = std::stod(next());
+      else if (a == "--camera") source = next();
+      else if (a == "--config") config_dir = next();
+      else if (a == "--views") wanted_views = std::stoi(next());
+      else throw std::runtime_error("option inconnue : " + a);
+    }
+    if (screen && square_mm <= 0.0) {
+      throw std::runtime_error("mode écran : donnez le côté d'une case mesuré à l'écran, ex. --square-mm 31.5");
+    }
+    const ConfigNode cam = ConfigNode::loadFile(config_dir + "/params.yaml").child("hardware");
+    if (source.empty()) source = cam.getString("camera_source");
+    const CharucoSpec spec = loadCharucoSpec(
+        ConfigNode::loadFile(config_dir + "/params.yaml").child("perception").child("charuco"), screen ? square_mm : 0.0);
+
+    if (screen) {
+      // Plateau en plein écran, sur fond blanc (marge = zone blanche autour des cases).
+      cv::Mat board_img;
+      makeBoard(spec).generateImage(cv::Size(1000, 1400), board_img, 60, 1);
+      cv::namedWindow("plateau", cv::WINDOW_NORMAL);
+      cv::setWindowProperty("plateau", cv::WND_PROP_FULLSCREEN, cv::WINDOW_FULLSCREEN);
+      cv::imshow("plateau", board_img);
+      std::cout << "Plateau affiché. Vérifiez à la règle qu'une case mesure bien " << square_mm
+                << " mm, puis filmez l'écran (luminosité au maximum).\n";
+    }
+
+    SteadyClock clock;
+    OpenCvCamera camera(source, cam.getInt("camera_width", 16, 10000), cam.getInt("camera_height", 16, 10000),
+                                    0.0, clock);
+    CameraCalibrator calibrator(spec);
+    std::cout << "ESPACE = garder la vue, C = calibrer, ÉCHAP = quitter. Objectif : " << wanted_views
+              << " vues variées (inclinées, proches, loin, dans les coins de l'image).\n";
+    std::string message;
+    while (true) {
+      const auto frame = camera.grab();
+      if (frame) {
+        cv::Mat view = frame->image.clone();
+        const auto corners = calibrator.detectCorners(view);
+        for (const auto& c : corners) cv::circle(view, c, 4, cv::Scalar(0, 255, 0), cv::FILLED);
+        drawStatusLine(view, "vues : " + std::to_string(calibrator.views()) + " / " +
+                                      std::to_string(wanted_views) + "   coins vus : " + std::to_string(corners.size()), 0);
+        drawStatusLine(view, "ESPACE garder la vue   C calibrer   ECHAP quitter", 1, cv::Scalar(0, 255, 255));
+        if (!message.empty()) drawStatusLine(view, message, 2, cv::Scalar(0, 200, 255));
+        cv::resize(view, view, cv::Size(), 0.75, 0.75);
+        cv::imshow("camera_tool calib", view);
+      }
+      const int key = cv::waitKey(10);
+      if (key == 27) break;
+      if (key == ' ' && frame) {
+        message = calibrator.addView(frame->image) ? "vue gardee" : "pas assez de coins : rapprochez le plateau";
+      }
+      if (key == 'c' || key == 'C') {
+        CameraIntrinsics intr;
+        const double rms = calibrator.calibrate(intr);
+        if (rms < 0) {
+          message = "il faut au moins 4 vues (20 conseillees)";
+          continue;
+        }
+        const std::string path = config_dir + "/camera.yaml";
+        saveIntrinsics(path, intr, rms);
+        std::cout << "Erreur de reprojection RMS : " << rms << " px (objectif < 0,5 px)\n"
+                  << "fx " << intr.K(0, 0) << "  fy " << intr.K(1, 1) << "  cx " << intr.K(0, 2)
+                  << "  cy " << intr.K(1, 2) << "\nÉcrit dans " << path << "\n";
+        message = "rms " + std::to_string(rms) + " px, enregistre dans " + path;
+      }
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "Erreur : " << e.what() << "\n";
+    return 1;
+  }
+  return 0;
+}
+
+
+// mesure de la latence
+int cmdLatency(int argc, char** argv) {
+  try {
+    std::string config_dir = "config", source;
+    int samples_wanted = 150;
+    bool write = false;
+    for (int i = 1; i < argc; ++i) {
+      const std::string a = argv[i];
+      if (a == "--camera" && i + 1 < argc) source = argv[++i];
+      else if (a == "--samples" && i + 1 < argc) samples_wanted = std::stoi(argv[++i]);
+      else if (a == "--config" && i + 1 < argc) config_dir = argv[++i];
+      else if (a == "--write") write = true;
+      else throw std::runtime_error("option inconnue : " + a);
+    }
+    const std::string hw_path = config_dir + "/params.yaml";
+    const ConfigNode cam = ConfigNode::loadFile(hw_path).child("hardware");
+    if (source.empty()) source = cam.getString("camera_source");
+
+    SteadyClock clock;
+    // Latence 0 : on veut l'heure de RÉCEPTION brute des images.
+    OpenCvCamera camera(source, cam.getInt("camera_width", 16, 10000), cam.getInt("camera_height", 16, 10000),
+                                    0.0, clock);
+    const MarkerDetector detector;
+    std::array<Time, 50> shown_at{};
+    shown_at.fill(-1.0);
+    std::vector<double> latencies;
+    cv::namedWindow("latence", cv::WINDOW_NORMAL);
+    int counter = 0;
+    std::cout << "Filmez la fenêtre « latence » avec l'iPhone. ÉCHAP pour arrêter.\n";
+    while (static_cast<int>(latencies.size()) < samples_wanted) {
+      const int id = counter++ % 50;
+      cv::Mat tag, screen(700, 700, CV_8UC1, cv::Scalar(255));
+      cv::aruco::generateImageMarker(markerDictionary(), id, 500, tag);
+      tag.copyTo(screen(cv::Rect(100, 100, 500, 500)));
+      cv::imshow("latence", screen);
+      if (cv::waitKey(1) == 27) break;
+      shown_at[id] = clock.now();  // l'image est à l'écran (à un rafraîchissement près)
+
+      if (const auto frame = camera.grab()) {
+        for (const auto& d : detector.detect(frame->image)) {
+          if (d.id < 0 || d.id >= 50 || shown_at[d.id] < 0) continue;
+          const double latency = frame->stamp - shown_at[d.id];
+          if (latency > 0.0 && latency < 1.0) latencies.push_back(latency);
+        }
+      }
+    }
+    if (latencies.empty()) throw std::runtime_error("aucun tag vu : la caméra filme-t-elle l'écran ?");
+    std::sort(latencies.begin(), latencies.end());
+    const double median = latencies[latencies.size() / 2];
+    std::cout << "Latence caméra : médiane " << median * 1000 << " ms (min " << latencies.front() * 1000
+              << ", max " << latencies.back() * 1000 << ", " << latencies.size() << " mesures)\n";
+    if (write) {
+      std::ifstream in(hw_path);
+      std::stringstream text;
+      text << in.rdbuf();
+      std::ostringstream value;
+      value << "  camera_latency: " << median;
+      const std::string updated =
+          std::regex_replace(text.str(), std::regex("  camera_latency: [0-9.eE+-]+"), value.str(),
+                             std::regex_constants::format_first_only);
+      std::ofstream(hw_path) << updated;
+      std::cout << hw_path << " mis à jour (hardware.camera_latency).\n";
+    } else {
+      std::cout << "Relancez avec --write pour l'enregistrer dans " << hw_path << ".\n";
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "Erreur : " << e.what() << "\n";
+    return 1;
+  }
+  return 0;
+}
+
+
+namespace {
+bool arenaFullyVisible(const CameraModel& camera, const ArenaConfig& a) {
+  const std::vector<cv::Point3f> corners{{static_cast<float>(a.x_min), static_cast<float>(a.y_min), 0},
+                                         {static_cast<float>(a.x_max), static_cast<float>(a.y_min), 0},
+                                         {static_cast<float>(a.x_max), static_cast<float>(a.y_max), 0},
+                                         {static_cast<float>(a.x_min), static_cast<float>(a.y_max), 0}};
+  for (const cv::Point2f& p : camera.project(corners)) {
+    if (p.x < 0 || p.y < 0 || p.x >= camera.intrinsics().width || p.y >= camera.intrinsics().height) return false;
+  }
+  return true;
+}
+}  // namespace
+
+// extrinsèques et contrôle de l'arène
+int cmdArena(int argc, char** argv) {
+  try {
+    std::vector<std::string> rest;
+    const RigOptions options = parseRigOptions(argc, argv, rest);
+    const bool once = std::find(rest.begin(), rest.end(), "--once") != rest.end();
+    // --view : juste regarder la caméra, avec la pose du sol déjà enregistrée (rien n'est réécrit).
+    const bool view_only = std::find(rest.begin(), rest.end(), "--view") != rest.end();
+    Rig rig(options);
+    const CameraModel camera = rig.cameraModel(!view_only);
+    const auto& arena = rig.setup().arena;
+    const bool visible = arenaFullyVisible(camera, arena);
+    std::cout << "Toute l'arène est dans l'image : " << (visible ? "oui" : "NON (monter ou recentrer le téléphone)") << "\n";
+    if (!rig.isSim() && !view_only) std::cout << "Extrinsèques enregistrés dans " << rig.extrinsicsPath() << "\n";
+    if (once) return 0;
+
+    ArenaCalibrator checker(rig.intrinsics(), arena);
+    const MarkerDetector detector;
+    bool placed = false;
+    while (true) {
+      // --view : n'envoie rien au robot (rig.tick renverrait des ordres "stop" à chaque tour).
+      if (view_only) std::this_thread::sleep_for(std::chrono::milliseconds(15));
+      else rig.tick(1.0 / 30.0);
+      const auto frame = rig.camera().grab();
+      if (!frame) continue;
+      cv::Mat view = frame->image.clone();
+      const auto detections = detector.detect(view);
+      drawDetections(view, detections);
+      drawWorldGrid(view, camera, arena);
+      // Contrôle continu : la caméra a-t-elle bougé ?
+      const double err = checker.reprojectionError(frame->image, camera.rvec(), camera.tvec());
+      const bool ok = err >= 0 && err < 3.0;  // tags posés à la main : 2 à 3 px est normal
+      drawStatusLine(view, "reprojection des tags sol : " + (err < 0 ? std::string("tags non vus") : std::to_string(err) + " px"),
+                          0, ok ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255));
+      if (err > 5.0) drawStatusLine(view, "ATTENTION : la camera a bouge ? relancer camera_tool arena", 1, cv::Scalar(0, 0, 255));
+      drawStatusLine(view, std::string("arene entiere visible : ") + (visible ? "oui" : "NON"), 2);
+      // --view : petite fenêtre gardée au-dessus des autres (pour la laisser ouverte pendant les essais).
+      const char* window = view_only ? "camera" : "camera_tool arena";
+      cv::resize(view, view, cv::Size(), view_only ? 0.33 : 0.75, view_only ? 0.33 : 0.75);
+      cv::imshow(window, view);
+      if (view_only && !placed) {
+        cv::setWindowProperty(window, cv::WND_PROP_TOPMOST, 1);
+        cv::moveWindow(window, 0, 0);  // coin en haut à gauche, pour ne pas cacher robot_nav
+        placed = true;
+      }
+      if (cv::waitKey(1) == 27) break;
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "Erreur : " << e.what() << "\n";
+    return 1;
+  }
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  const std::string cmd = argc > 1 ? argv[1] : "";
+  if (cmd == "markers") return cmdMarkers(argc - 1, argv + 1);
+  if (cmd == "calib") return cmdCalib(argc - 1, argv + 1);
+  if (cmd == "latency") return cmdLatency(argc - 1, argv + 1);
+  if (cmd == "arena") return cmdArena(argc - 1, argv + 1);
+  std::cerr << "Outils caméra.\n  camera_tool markers [--draw]                 tags et plateau ChArUco à imprimer (tools/print/)\n  camera_tool calib [--screen --square-mm X]   intrinsèques de l'iPhone -> config/camera.yaml\n  camera_tool latency [--write]                retard de la caméra (filmer l'écran)\n  camera_tool arena --sim|--real [--once]      pose de la caméra par rapport au sol -> config/arena_extrinsics.yaml\n  camera_tool arena --real --view              regarder la caméra (sans recalculer)\n";
+  return 1;
+}
