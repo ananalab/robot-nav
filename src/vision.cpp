@@ -502,3 +502,232 @@ void ObstacleDetector::addFrame(const cv::Mat& bgr, const CameraModel& camera,
                                 double robot_marker_height) {
   const OccupancyGrid g = detect(bgr, camera, robot, robot_marker_height);
   if (votes_.empty()) votes_.assign(g.cols() * g.rows(), 0);
+  for (int i = 0; i < g.cols() * g.rows(); ++i) {
+    if (g.at(g.fromLinear(i)) == CellState::Occupied) ++votes_[i];
+  }
+  ++frames_added_;
+}
+
+OccupancyGrid ObstacleDetector::result() const {
+  OccupancyGrid grid = makeArenaGrid(arena_, resolution_);
+  if (votes_.empty()) return grid;
+  for (int i = 0; i < grid.cols() * grid.rows(); ++i) {
+    // Vote majoritaire : occupé si vu occupé sur plus de la moitié des images.
+    if (2 * votes_[i] > frames_added_) grid.set(grid.fromLinear(i), CellState::Occupied);
+  }
+  return grid;
+}
+
+double occupancyIoU(const OccupancyGrid& a, const OccupancyGrid& b, const ArenaConfig& arena) {
+  int inter = 0, uni = 0;
+  for (int i = 0; i < a.cols() * a.rows(); ++i) {
+    const GridIndex c = a.fromLinear(i);
+    const Eigen::Vector2d w = a.cellToWorld(c);
+    if (w.x() < arena.x_min || w.x() > arena.x_max || w.y() < arena.y_min || w.y() > arena.y_max) continue;
+    const bool oa = a.at(c) == CellState::Occupied;
+    const bool ob = b.at(c) == CellState::Occupied;
+    inter += oa && ob;
+    uni += oa || ob;
+  }
+  return uni == 0 ? 1.0 : static_cast<double>(inter) / uni;
+}
+
+OpenCvCamera::OpenCvCamera(const std::string& source, int width, int height, double latency,
+                           const IClock& clock)
+    : latency_(latency), clock_(clock) {
+  const bool is_index = !source.empty() && source.find_first_not_of("0123456789") == std::string::npos;
+  if (is_index) {
+    capture_.open(std::stoi(source));
+  } else {
+    capture_.open(source);
+  }
+  if (!capture_.isOpened()) {
+    throw std::runtime_error("caméra '" + source +
+                             "' impossible à ouvrir (sur Mac : Réglages > Confidentialité > Caméra)");
+  }
+  capture_.set(cv::CAP_PROP_FRAME_WIDTH, width);
+  capture_.set(cv::CAP_PROP_FRAME_HEIGHT, height);
+  capture_.set(cv::CAP_PROP_BUFFERSIZE, 1);
+  // Le thread de capture : le seul autre thread du programme (avec MPPI éventuellement).
+  thread_ = std::thread(&OpenCvCamera::captureLoop, this);
+}
+
+OpenCvCamera::~OpenCvCamera() {
+  running_ = false;
+  if (thread_.joinable()) thread_.join();
+}
+
+void OpenCvCamera::captureLoop() {
+  Time last = clock_.now();
+  while (running_) {
+    cv::Mat image;
+    if (!capture_.read(image) || image.empty()) continue;
+    const Time now = clock_.now();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_ = {image, now - latency_};
+      fresh_ = true;
+    }
+    // Fréquence lissée : fps = 0.9 fps + 0.1 / dt
+    const double dt = now - last;
+    last = now;
+    if (dt > 0.0) fps_ = 0.9 * fps_.load() + 0.1 / dt;
+  }
+}
+
+std::optional<Frame> OpenCvCamera::grab() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!fresh_) return std::nullopt;
+  fresh_ = false;
+  return latest_;
+}
+
+CharucoSpec loadCharucoSpec(const ConfigNode& section, double square_mm_override) {
+  CharucoSpec s;
+  s.squares_x = section.getInt("squares_x", 3, 20);
+  s.squares_y = section.getInt("squares_y", 3, 20);
+  const double square_mm = section.getDouble("square_mm", 5.0, 100.0);
+  const double marker_mm = section.getDouble("marker_mm", 3.0, square_mm);
+  // Mode écran : la taille réelle des cases dépend de l'écran ; le tag garde la même proportion.
+  const double scale = square_mm_override > 0.0 ? square_mm_override / square_mm : 1.0;
+  s.square = square_mm * scale / 1000.0;
+  s.marker = marker_mm * scale / 1000.0;
+  return s;
+}
+
+cv::aruco::CharucoBoard makeBoard(const CharucoSpec& spec) {
+  return cv::aruco::CharucoBoard(cv::Size(spec.squares_x, spec.squares_y),
+                                 static_cast<float>(spec.square), static_cast<float>(spec.marker),
+                                 cv::aruco::getPredefinedDictionary(cv::aruco::DICT_5X5_100));
+}
+
+CameraCalibrator::CameraCalibrator(const CharucoSpec& spec)
+    : board_(makeBoard(spec)), detector_(board_) {}
+
+std::vector<cv::Point2f> CameraCalibrator::detectCorners(const cv::Mat& image) const {
+  std::vector<cv::Point2f> corners;
+  std::vector<int> ids;
+  detector_.detectBoard(image, corners, ids);
+  return corners;
+}
+
+bool CameraCalibrator::addView(const cv::Mat& image) {
+  std::vector<cv::Point2f> corners;
+  std::vector<int> ids;
+  detector_.detectBoard(image, corners, ids);
+  if (corners.size() < 8) return false;
+  // Correspondances coin du plateau (en mètres, z = 0) <-> pixel.
+  std::vector<cv::Point3f> object;
+  std::vector<cv::Point2f> pixels;
+  board_.matchImagePoints(corners, ids, object, pixels);
+  object_points_.push_back(object);
+  image_points_.push_back(pixels);
+  image_size_ = image.size();
+  return true;
+}
+
+double CameraCalibrator::calibrate(CameraIntrinsics& out) const {
+  if (object_points_.size() < 4) return -1.0;
+  cv::Mat K, dist;
+  std::vector<cv::Mat> rvecs, tvecs;
+  // Modèle à 5 coefficients (k1 k2 p1 p2 k3) ; Levenberg-Marquardt dans OpenCV.
+  const double rms = cv::calibrateCamera(object_points_, image_points_, image_size_, K, dist, rvecs, tvecs);
+  out.width = image_size_.width;
+  out.height = image_size_.height;
+  out.K = cv::Matx33d(K);
+  out.distortion.assign(dist.begin<double>(), dist.begin<double>() + 5);
+  return rms;
+}
+
+namespace {
+constexpr double kFloorMetersPerPixel = 0.002;
+constexpr double kFloorMargin = 0.3;  // le sol simulé dépasse l'arène de 30 cm
+
+// Image d'un tag avec sa marge blanche : carré de "outer" mètres, tag noir de "inner".
+cv::Mat taggedSquare(int id, double inner, double outer, int pixels) {
+  cv::Mat square(pixels, pixels, CV_8UC1, cv::Scalar(255));
+  const int tag_px = static_cast<int>(std::lround(pixels * inner / outer));
+  cv::Mat tag;
+  cv::aruco::generateImageMarker(markerDictionary(), id, tag_px, tag);
+  const int offset = (pixels - tag_px) / 2;
+  tag.copyTo(square(cv::Rect(offset, offset, tag_px, tag_px)));
+  cv::Mat bgr;
+  cv::cvtColor(square, bgr, cv::COLOR_GRAY2BGR);
+  return bgr;
+}
+}  // namespace
+
+SimCameraConfig loadSimCameraConfig(const ConfigNode& c) {
+  SimCameraConfig cfg;
+  cfg.intrinsics.width = c.getInt("width", 160, 4000);
+  cfg.intrinsics.height = c.getInt("height", 120, 4000);
+  const double fx = c.getDouble("fx", 50.0, 1e4);
+  const double fy = c.getDouble("fy", 50.0, 1e4);
+  cfg.intrinsics.K = cv::Matx33d(fx, 0, cfg.intrinsics.width / 2.0, 0, fy,
+                                 cfg.intrinsics.height / 2.0, 0, 0, 1);
+  cfg.intrinsics.distortion = {c.getDouble("k1", -1.0, 1.0), 0.0, 0.0, 0.0, 0.0};
+  const auto pos = c.getDoubleList("position", 3);
+  cfg.position = {pos[0], pos[1], pos[2]};
+  cfg.tilt = degToRad(c.getDouble("tilt_deg", -45.0, 45.0));
+  cfg.yaw = degToRad(c.getDouble("yaw_deg", -180.0, 180.0));
+  cfg.fps = c.getDouble("fps", 1.0, 240.0);
+  cfg.latency = c.getDouble("latency", 0.0, 2.0);
+  cfg.p_drop = c.getDouble("p_drop", 0.0, 1.0);
+  cfg.p_occlusion = c.getDouble("p_occlusion", 0.0, 1.0);
+  cfg.blur_sigma = c.getDouble("blur_sigma", 0.0, 10.0);
+  cfg.noise_sigma = c.getDouble("noise_sigma", 0.0, 50.0);
+  cfg.exposure_sigma = c.getDouble("exposure_sigma", 0.0, 0.5);
+  cfg.chassis_length = c.getDouble("chassis_length", 0.02, 0.5);
+  cfg.chassis_width = c.getDouble("chassis_width", 0.02, 0.5);
+  cfg.roof_size = c.getDouble("roof_size", 0.02, 0.5);
+  for (const ConfigNode& col : c.list("obstacle_colors")) {
+    const auto bgr = col.getDoubleList("bgr", 3);
+    cfg.colors.emplace_back(col.getString("name"), cv::Scalar(bgr[0], bgr[1], bgr[2]));
+  }
+  return cfg;
+}
+
+SimCamera::SimCamera(const SimCameraConfig& config, const RobotConfig& robot,
+                     const ArenaConfig& arena, const SimWorld& world,
+                     const IClock& clock, unsigned seed)
+    : config_(config), robot_(robot), arena_(arena), world_(world), clock_(clock), rng_(seed) {
+  cv::Vec3d rvec, tvec;
+  lookDownExtrinsics(config.position, config.tilt, config.yaw, rvec, tvec);
+  model_ = CameraModel(config.intrinsics, rvec, tvec);
+  cv::Matx33d r;
+  cv::Rodrigues(rvec, r);
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) R_(i, j) = r(i, j);
+  t_ = {tvec[0], tvec[1], tvec[2]};
+  buildFloorTexture();
+  buildDistortionMaps();
+  // Toit du robot : carton blanc avec le tag 10 au centre, le haut du tag vers l'avant.
+  robot_texture_ = taggedSquare(arena.robot_tag_id, robot.marker_size, config.roof_size, 330);
+}
+
+void SimCamera::buildFloorTexture() {
+  const double x0 = arena_.x_min - kFloorMargin, x1 = arena_.x_max + kFloorMargin;
+  const double y0 = arena_.y_min - kFloorMargin, y1 = arena_.y_max + kFloorMargin;
+  const int w = static_cast<int>((x1 - x0) / kFloorMetersPerPixel);
+  const int h = static_cast<int>((y1 - y0) / kFloorMetersPerPixel);
+  // Sol gris avec un bruit fixe un peu flouté (texture de lino / parquet mat).
+  cv::Mat noise(h, w, CV_8UC1);
+  cv::RNG fixed(1234);
+  fixed.fill(noise, cv::RNG::NORMAL, 150, 18);
+  cv::GaussianBlur(noise, noise, cv::Size(0, 0), 1.5);
+  cv::cvtColor(noise, floor_texture_, cv::COLOR_GRAY2BGR);
+  // Pixel (u, v) -> monde (x0 + u m, y1 - v m) : le haut de la texture est +y.
+  floor_to_world_ = cv::Matx33d(kFloorMetersPerPixel, 0, x0, 0, -kFloorMetersPerPixel, y1, 0, 0, 1);
+  // Tags sol : 12 cm de noir + 2 cm de blanc autour (une case), haut vers +y.
+  for (const FloorTag& tag : arena_.floor_tags) {
+    const double outer = arena_.floor_tag_size * 8.0 / 6.0;
+    const int px = static_cast<int>(std::lround(outer / kFloorMetersPerPixel));
+    const cv::Mat img = taggedSquare(tag.id, arena_.floor_tag_size, outer, px);
+    const int u = static_cast<int>(std::lround((tag.x - outer / 2 - x0) / kFloorMetersPerPixel));
+    const int v = static_cast<int>(std::lround((y1 - (tag.y + outer / 2)) / kFloorMetersPerPixel));
+    const cv::Rect roi = cv::Rect(u, v, px, px) & cv::Rect(0, 0, w, h);
+    img(cv::Rect(roi.x - u, roi.y - v, roi.width, roi.height)).copyTo(floor_texture_(roi));
+  }
+}
+
+void SimCamera::buildDistortionMaps() {
