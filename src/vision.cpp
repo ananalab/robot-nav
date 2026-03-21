@@ -731,3 +731,187 @@ void SimCamera::buildFloorTexture() {
 }
 
 void SimCamera::buildDistortionMaps() {
+  // Pour chaque pixel de l'image finale (avec distorsion), on cherche d'où il vient
+  // dans l'image idéale (sans distorsion) : undistortPoints puis reprojection par K.
+  const int w = config_.intrinsics.width, h = config_.intrinsics.height;
+  std::vector<cv::Point2f> distorted;
+  distorted.reserve(static_cast<std::size_t>(w) * h);
+  for (int v = 0; v < h; ++v)
+    for (int u = 0; u < w; ++u) distorted.emplace_back(static_cast<float>(u), static_cast<float>(v));
+  std::vector<cv::Point2f> ideal;
+  cv::undistortPoints(distorted, ideal, config_.intrinsics.K, config_.intrinsics.distortion,
+                      cv::noArray(), config_.intrinsics.K);
+  map_x_.create(h, w, CV_32FC1);
+  map_y_.create(h, w, CV_32FC1);
+  for (int v = 0; v < h; ++v) {
+    for (int u = 0; u < w; ++u) {
+      map_x_.at<float>(v, u) = ideal[v * w + u].x;
+      map_y_.at<float>(v, u) = ideal[v * w + u].y;
+    }
+  }
+}
+
+cv::Point2f SimCamera::projectIdeal(const Eigen::Vector3d& p) const {
+  const Eigen::Vector3d c = R_ * p + t_;
+  const auto& K = config_.intrinsics.K;
+  return {static_cast<float>(K(0, 0) * c.x() / c.z() + K(0, 2)),
+          static_cast<float>(K(1, 1) * c.y() / c.z() + K(1, 2))};
+}
+
+cv::Matx33d SimCamera::planeHomography(double h) const {
+  // Point (x, y, h) du plan : K (R [x y h]^T + t) = K [r1 r2 (h r3 + t)] [x y 1]^T
+  const Eigen::Vector3d third = h * R_.col(2) + t_;
+  cv::Matx33d m(R_(0, 0), R_(0, 1), third.x(), R_(1, 0), R_(1, 1), third.y(), R_(2, 0), R_(2, 1),
+                third.z());
+  return config_.intrinsics.K * m;
+}
+
+void SimCamera::warpPlaneTexture(cv::Mat& img, const cv::Mat& texture,
+                                 const cv::Matx33d& tex_to_world, double h) const {
+  const cv::Matx33d H = planeHomography(h) * tex_to_world;
+  // On ne déforme que le rectangle de l'image touché par la texture (plus rapide).
+  std::vector<cv::Point2f> corners{{0, 0},
+                                   {static_cast<float>(texture.cols), 0},
+                                   {static_cast<float>(texture.cols), static_cast<float>(texture.rows)},
+                                   {0, static_cast<float>(texture.rows)}};
+  std::vector<cv::Point2f> projected;
+  cv::perspectiveTransform(corners, projected, H);
+  const cv::Rect roi = cv::boundingRect(projected) & cv::Rect(0, 0, img.cols, img.rows);
+  if (roi.area() == 0) return;
+  const cv::Matx33d shift(1, 0, -roi.x, 0, 1, -roi.y, 0, 0, 1);
+  cv::Mat view = img(roi);
+  cv::warpPerspective(texture, view, shift * H, roi.size(), cv::INTER_LINEAR,
+                      cv::BORDER_TRANSPARENT);
+}
+
+cv::Scalar SimCamera::colorOf(const std::string& name) const {
+  for (const auto& color : config_.colors) {
+    if (color.first == name) return color.second;
+  }
+  return cv::Scalar(40, 40, 200);
+}
+
+void SimCamera::drawBox(cv::Mat& img, const Box& box, const cv::Scalar& color) const {
+  // 8 coins, puis 5 faces visibles potentielles (dessus + 4 côtés). Les faces tournées
+  // vers la caméra sont dessinées de la plus lointaine à la plus proche (peintre).
+  const double c = std::cos(box.yaw), s = std::sin(box.yaw);
+  std::array<Eigen::Vector3d, 8> p;
+  for (int k = 0; k < 4; ++k) {
+    const double lx = (k == 0 || k == 3 ? 0.5 : -0.5) * box.length;
+    const double ly = (k < 2 ? 0.5 : -0.5) * box.width;
+    const Eigen::Vector3d base(box.x + c * lx - s * ly, box.y + s * lx + c * ly, 0.0);
+    p[k] = base;
+    p[k + 4] = base + Eigen::Vector3d(0, 0, box.height);
+  }
+  struct Face {
+    std::array<int, 4> idx;
+    double shade;
+  };
+  const std::array<Face, 5> faces{{{{4, 5, 6, 7}, 1.0},
+                                   {{0, 1, 5, 4}, 0.6},
+                                   {{1, 2, 6, 5}, 0.55},
+                                   {{2, 3, 7, 6}, 0.6},
+                                   {{3, 0, 4, 7}, 0.55}}};
+  std::vector<std::pair<double, const Face*>> visible;
+  const Eigen::Vector3d center(box.x, box.y, 0.0);
+  const Eigen::Vector3d cam = model_.center();
+  for (const Face& f : faces) {
+    Eigen::Vector3d mid = Eigen::Vector3d::Zero();
+    for (int i : f.idx) mid += p[i] / 4.0;
+    // Normale sortante : verticale pour le dessus, horizontale pour les côtés
+    // (marche aussi pour une feuille à plat, de hauteur nulle).
+    Eigen::Vector3d normal = mid - center;
+    normal.z() = 0.0;
+    if (&f == &faces[0]) normal = Eigen::Vector3d::UnitZ();
+    if (normal.dot(cam - mid) > 0.0) visible.emplace_back((cam - mid).norm(), &f);
+  }
+  std::sort(visible.begin(), visible.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+  for (const auto& face : visible) {
+    const Face* f = face.second;
+    std::vector<cv::Point> poly;
+    for (int i : f->idx) {
+      const cv::Point2f q = projectIdeal(p[i]);
+      poly.emplace_back(static_cast<int>(std::lround(q.x * 16)), static_cast<int>(std::lround(q.y * 16)));
+    }
+    cv::fillConvexPoly(img, poly, color * f->shade, cv::LINE_AA, 4);
+  }
+}
+
+cv::Mat SimCamera::render(bool show_robot_tag) const {
+  const int w = config_.intrinsics.width, h = config_.intrinsics.height;
+  cv::Mat ideal(h, w, CV_8UC3, cv::Scalar(60, 60, 60));
+  warpPlaneTexture(ideal, floor_texture_, floor_to_world_, 0.0);
+
+  // Boîtes et châssis, des plus lointains aux plus proches de la caméra.
+  const Pose2D robot = world_.groundTruthPose();
+  const Pose2D marker = compose(robot, robot_.marker_offset);
+  Box chassis{marker.x, marker.y, config_.chassis_length, config_.chassis_width,
+              std::max(0.0, robot_.marker_height - 0.005), marker.theta, "chassis"};
+  std::vector<std::pair<double, std::pair<const Box*, cv::Scalar>>> boxes;
+  const Eigen::Vector3d cam = model_.center();
+  for (const Box& b : world_.obstacles()) {
+    boxes.push_back({(Eigen::Vector3d(b.x, b.y, 0) - cam).norm(), {&b, colorOf(b.color)}});
+  }
+  boxes.push_back({(Eigen::Vector3d(chassis.x, chassis.y, 0) - cam).norm(),
+                   {&chassis, cv::Scalar(45, 45, 45)}});
+  std::sort(boxes.begin(), boxes.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  for (const auto& b : boxes) drawBox(ideal, *b.second.first, b.second.second);
+
+  // Toit blanc + tag : texture (u, v) -> repère M -> monde, au plan z = h_marker.
+  const double m = config_.roof_size / robot_texture_.cols;
+  const cv::Matx33d tex_to_marker(0, -m, config_.roof_size / 2, -m, 0, config_.roof_size / 2, 0, 0, 1);
+  const double c = std::cos(marker.theta), s = std::sin(marker.theta);
+  const cv::Matx33d marker_to_world(c, -s, marker.x, s, c, marker.y, 0, 0, 1);
+  if (show_robot_tag) {
+    warpPlaneTexture(ideal, robot_texture_, marker_to_world * tex_to_marker, robot_.marker_height);
+  } else {
+    // Tag masqué (main, reflet...) : on ne voit que le carton blanc.
+    const cv::Mat blank(robot_texture_.size(), robot_texture_.type(), cv::Scalar(235, 235, 235));
+    warpPlaneTexture(ideal, blank, marker_to_world * tex_to_marker, robot_.marker_height);
+  }
+
+  cv::Mat out;
+  cv::remap(ideal, out, map_x_, map_y_, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+  return out;
+}
+
+void SimCamera::degrade(cv::Mat& img) {
+  if (config_.blur_sigma > 0.0) {
+    cv::GaussianBlur(img, img, cv::Size(0, 0), config_.blur_sigma);
+  }
+  if (config_.exposure_sigma > 0.0) {
+    std::normal_distribution<double> exposure(1.0, config_.exposure_sigma);
+    img.convertTo(img, -1, exposure(rng_), 0.0);
+  }
+  if (config_.noise_sigma > 0.0) {
+    cv::Mat noise(img.size(), CV_16SC3);
+    cv::RNG cv_rng(rng_());  // bruit OpenCV seedé depuis notre générateur : reproductible
+    cv_rng.fill(noise, cv::RNG::NORMAL, 0, config_.noise_sigma);
+    cv::Mat img16;
+    img.convertTo(img16, CV_16SC3);
+    img16 += noise;
+    img16.convertTo(img, CV_8UC3);
+  }
+}
+
+void SimCamera::capture(Time t) {
+  std::uniform_real_distribution<double> uniform(0.0, 1.0);
+  if (uniform(rng_) < config_.p_drop) {
+    return;  // image perdue
+  }
+  const bool occluded = uniform(rng_) < config_.p_occlusion;
+  cv::Mat img = render(!occluded);
+  degrade(img);
+  pending_.push_back({img, t});
+}
+
+std::optional<Frame> SimCamera::grab() {
+  std::optional<Frame> latest;
+  const Time now = clock_.now();
+  while (!pending_.empty() && pending_.front().stamp + config_.latency <= now + 1e-9) {
+    latest = pending_.front();
+    pending_.pop_front();
+  }
+  return latest;
+}
