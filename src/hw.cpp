@@ -110,3 +110,116 @@ bool SerialTransport::writeLine(std::string_view line) {
   return ::write(fd_, data.data(), data.size()) == static_cast<ssize_t>(data.size());
 }
 
+void SerialTransport::readAvailable() {
+  char buf[256];
+  ssize_t n = 0;
+  while ((n = ::read(fd_, buf, sizeof(buf))) > 0) pending_.append(buf, static_cast<std::size_t>(n));
+}
+
+std::vector<std::string> listSerialPorts() {
+  std::vector<std::string> ports;
+  const char* patterns[] = {"cu.usbserial", "cu.usbmodem", "cu.wchusbserial", "ttyUSB", "ttyACM"};
+  for (const auto& entry : std::filesystem::directory_iterator("/dev")) {
+    const std::string name = entry.path().filename().string();
+    for (const char* p : patterns) {
+      if (name.rfind(p, 0) == 0) ports.push_back(entry.path().string());
+    }
+  }
+  std::sort(ports.begin(), ports.end());
+  return ports;
+}
+
+
+UdpTransport::UdpTransport(const std::string& robot_ip, int port) : ip_(robot_ip), port_(port) {
+  socket_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (socket_ < 0) throw std::runtime_error("impossible de créer la socket UDP");
+}
+
+UdpTransport::~UdpTransport() {
+  if (socket_ >= 0) ::close(socket_);
+}
+
+bool UdpTransport::writeLine(std::string_view line) {
+  sockaddr_in robot{};
+  robot.sin_family = AF_INET;
+  robot.sin_port = htons(static_cast<uint16_t>(port_));
+  if (inet_pton(AF_INET, ip_.c_str(), &robot.sin_addr) != 1) return false;
+  const std::string data = std::string(line) + "\n";
+  return ::sendto(socket_, data.data(), data.size(), 0, reinterpret_cast<sockaddr*>(&robot),
+                  sizeof(robot)) == static_cast<ssize_t>(data.size());
+}
+
+std::optional<std::string> SerialTransport::readLine() {
+  readAvailable();
+  const std::size_t end = pending_.find('\n');
+  if (end == std::string::npos) {
+    if (pending_.size() > 1024) pending_.clear();  // pas de fin de ligne : déchets
+    return std::nullopt;
+  }
+  std::string line = pending_.substr(0, end);
+  pending_.erase(0, end + 1);
+  if (!line.empty() && line.back() == '\r') line.pop_back();
+  return line;
+}
+
+ProtocolRobotConfig loadProtocolRobotConfig(const ConfigNode& section) {
+  ProtocolRobotConfig cfg;
+  cfg.resend_rate = section.getDouble("resend_rate", 5.0, 200.0);
+  cfg.ready_timeout = section.getDouble("ready_timeout", 0.0, 10.0);
+  return cfg;
+}
+
+ProtocolRobot::ProtocolRobot(ITransport& transport, IClock& clock,
+                             const ProtocolRobotConfig& config)
+    : transport_(transport), clock_(clock), config_(config) {}
+
+ProtocolRobot::~ProtocolRobot() { stop(); }
+
+bool ProtocolRobot::waitReady() {
+  const Time deadline = clock_.now() + config_.ready_timeout;
+  while (!boot_seen_ && clock_.now() < deadline) {
+    poll();
+    clock_.sleepUntil(clock_.now() + 0.01);
+  }
+  return boot_seen_;
+}
+
+void ProtocolRobot::transmit() {
+  seq_ = (seq_ + 1) & 0xFF;
+  sent_at_[seq_] = clock_.now();
+  last_sent_ = clock_.now();
+  transport_.writeLine(encodeMotor(toPwm(last_.left), toPwm(last_.right), seq_));
+}
+
+void ProtocolRobot::send(const WheelCmd& cmd) {
+  last_ = cmd;
+  transmit();
+}
+
+void ProtocolRobot::stop() {
+  last_ = {};
+  transport_.writeLine(encodeStop());
+  last_sent_ = clock_.now();
+}
+
+void ProtocolRobot::poll() {
+  while (const auto line = transport_.readLine()) {
+    const auto msg = parseRobotLine(*line);
+    if (!msg) continue;  // ligne corrompue : ignorée
+    switch (msg->type) {
+      case RobotMessage::Type::Ack:
+        last_rtt_ = clock_.now() - sent_at_[msg->seq];
+        break;
+      case RobotMessage::Type::Watchdog:
+        ++watchdog_count_;
+        break;
+      case RobotMessage::Type::Boot:
+        boot_seen_ = true;
+        break;
+    }
+  }
+  // Renvoi périodique : sans commande pendant 300 ms, le firmware coupe les moteurs.
+  if (clock_.now() - last_sent_ >= 1.0 / config_.resend_rate) {
+    transmit();
+  }
+}
