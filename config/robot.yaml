@@ -1,0 +1,37 @@
+# Ce qu'on mesure sur le robot et dans l'arène (en mètres et degrés).
+# La section robot.motors est réécrite par
+# "robot_tool calib".
+
+robot:
+  geometry:
+    wheel_base: 0.14          # entraxe b (milieu roue gauche -> milieu roue droite), mesuré
+    wheel_diameter: 0.063     # mesuré
+    robot_radius: 0.12        # rayon du cercle centré sur l'essieu qui englobe tout le robot, mesuré
+    marker_offset: [-0.0075, 0.0, 0.0]  # (dx, dy en m, dyaw en degrés) du centre du tag dans le repère robot, mesuré
+    marker_height: 0.1375     # hauteur du dessus du toit en carton (tag) au-dessus du sol, mesurée
+    marker_size: 0.085        # côté du carré noir du tag robot, mesuré (impression à 95 %)
+
+  motors:
+    left:
+      gain: 0.584458          # k : m/s par unité de commande au-delà de la zone morte
+      deadzone: 0.1           # u0 : commande minimale pour que la roue tourne (calib : 0 roue lancée)
+    right:
+      gain: 0.45073
+      deadzone: 0.1
+    tau: 0.126                # constante de temps du moteur (s)
+    delay: 0.113              # retard entre l'envoi de la commande et sa prise d'effet (s)
+
+arena:
+  bounds: [-0.07, -0.07, 1.40, 0.92]  # zone de jeu (m) : jusqu'aux lignes noires, tags compris
+  floor_tag_size: 0.114           # côté du carré noir des tags sol (imprimé à 95 % : 11,4 cm au lieu de 12)
+  floor_tags:                     # centres des tags sol, posés alignés avec les axes de W
+    # Calculés à partir des distances mesurées entre les centres des tags.
+    - {id: 0, x: 0.0, y: 0.0}
+    - {id: 1, x: 1.335, y: 0.0}
+    - {id: 2, x: 1.332, y: 0.850}
+    - {id: 3, x: -0.009, y: 0.850}
+  robot_tag_id: 10
+
+  obstacle_height: 0.0            # feuilles rouges posées à plat (boîtes : leur hauteur en m)
+  obstacle_colors:                # plages HSV OpenCV (H 0-179) ; h_min > h_max = le rouge qui fait le tour
+    - {name: red, h: [170, 10], s: [100, 255], v: [70, 255]}
