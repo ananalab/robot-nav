@@ -103,3 +103,109 @@ bool Ekf::correct(const PoseMeasurement& z) {
 }
 
 bool Ekf::update(const PoseMeasurement& measurement, Time now) {
+  PoseMeasurement z = measurement;
+  if (!config_.latency_compensation) {
+    z.stamp = std::max(time_, now);  // ablation : on fait comme si la mesure était actuelle
+  }
+  if (!initialized_ || health(now) == EkfHealth::Lost) {
+    initialize(z);
+    propagate(now);
+    history_.push_back({time_, x_, P_});
+    last_accept_time_ = now;
+    return true;
+  }
+
+  bool ok = false;
+  if (z.stamp >= time_) {
+    propagate(z.stamp);
+    ok = correct(z);
+    history_.push_back({time_, x_, P_});
+  } else {
+    // Mesure du passé : on revient au dernier instantané avant z.stamp...
+    auto it = std::find_if(history_.rbegin(), history_.rend(),
+                           [&](const Snapshot& s) { return s.t <= z.stamp; });
+    if (it == history_.rend()) {
+      ++rejected_;  // plus ancienne que le tampon
+      return false;
+    }
+    const Time end_time = time_;
+    std::vector<Time> replay_times;
+    for (auto later = it.base(); later != history_.end(); ++later) replay_times.push_back(later->t);
+    x_ = it->x;
+    P_ = it->P;
+    time_ = it->t;
+    history_.erase(it.base(), history_.end());
+    // ... on corrige à l'instant de la mesure, puis on rejoue les entrées jusqu'à maintenant.
+    propagate(z.stamp);
+    ok = correct(z);
+    for (Time t : replay_times) {
+      propagate(t);
+      history_.push_back({time_, x_, P_});
+    }
+    propagate(end_time);
+  }
+
+  if (ok) {
+    last_accept_time_ = now;
+    consecutive_rejections_ = 0;
+  } else {
+    ++rejected_;
+    // Beaucoup de rejets d'affilée : le filtre s'est sans doute perdu, on repart de la mesure.
+    if (++consecutive_rejections_ >= config_.max_rejections_before_reset) {
+      initialized_ = false;
+      return update(measurement, now);
+    }
+  }
+  return ok;
+}
+
+EkfHealth Ekf::health(Time now) const {
+  if (!initialized_) return EkfHealth::Uninitialized;
+  return now - last_accept_time_ > config_.lost_timeout ? EkfHealth::Lost : EkfHealth::Ok;
+}
+
+void Ekf::trimBuffers() {
+  const Time limit = time_ - config_.buffer_duration;
+  while (history_.size() > 1 && history_.front().t < limit) history_.pop_front();
+  // On garde la dernière entrée antérieure à la limite : elle est encore active.
+  while (inputs_.size() > 1 && inputs_[1].t_effective < limit) inputs_.pop_front();
+}
+
+BatteryMonitorConfig loadBatteryMonitorConfig(const ConfigNode& section) {
+  BatteryMonitorConfig cfg;
+  cfg.ratio = section.getDouble("ratio", 0.1, 1.0);
+  cfg.stall_ratio = section.getDouble("stall_ratio", 0.0, cfg.ratio);
+  cfg.duration = section.getDouble("duration", 0.1, 60.0);
+  cfg.window = section.getDouble("window", 0.1, 5.0);
+  cfg.min_speed = section.getDouble("min_speed", 0.0, 1.0);
+  cfg.max_turn_rate = section.getDouble("max_turn_rate", 0.0, 10.0);
+  return cfg;
+}
+
+BatteryMonitor::BatteryMonitor(const BatteryMonitorConfig& config) : config_(config) {}
+
+void BatteryMonitor::update(Time t, const Pose2D& estimate,
+                            const Twist2D& applied) {
+  const double dt = samples_.empty() ? 0.0 : t - samples_.back().t;
+  samples_.push_back({t, estimate.x, estimate.y, applied});
+  while (samples_.size() > 2 && samples_[1].t <= t - config_.window) samples_.pop_front();
+  const Sample& first = samples_.front();
+  const double span = t - first.t;
+  if (span < config_.window * 0.9) return;
+
+  // La fenêtre ne compte que si toutes les consignes y sont "ligne droite, assez vite".
+  double expected = 0.0;
+  for (const Sample& s : samples_) {
+    if (s.cmd.v < config_.min_speed || std::abs(s.cmd.omega) > config_.max_turn_rate) return;
+    expected += s.cmd.v / samples_.size();
+  }
+  const double measured = std::hypot(estimate.x - first.x, estimate.y - first.y) / span;
+  if (measured < config_.stall_ratio * expected) {
+    return;  // bloqué (collision) : ni preuve de pile faible, ni de pile bonne
+  }
+  if (measured < config_.ratio * expected) {
+    low_time_ += dt;
+  } else {
+    low_time_ = 0.0;
+  }
+}
