@@ -354,3 +354,241 @@ bool lineOfSight(const CostMap& map, const GridIndex& a, const GridIndex& b) {
   const int dcol = std::abs(b.col - a.col), drow = -std::abs(b.row - a.row);
   const int step_col = a.col < b.col ? 1 : -1;
   const int step_row = a.row < b.row ? 1 : -1;
+  int err = dcol + drow;
+  while (true) {
+    if (map.lethal({col, row})) {
+      return false;
+    }
+    if (col == b.col && row == b.row) {
+      return true;
+    }
+    const int e2 = 2 * err;
+    if (e2 >= drow) {
+      err += drow;
+      col += step_col;
+    }
+    if (e2 <= dcol) {
+      err += dcol;
+      row += step_row;
+    }
+  }
+}
+
+std::vector<GridIndex> shortcutPath(const CostMap& map, const std::vector<GridIndex>& cells) {
+  if (cells.size() <= 2) {
+    return cells;
+  }
+  std::vector<GridIndex> kept{cells.front()};
+  std::size_t i = 0;
+  while (i + 1 < cells.size()) {
+    // Point visible le plus lointain depuis cells[i] (au pire, le voisin i + 1).
+    std::size_t j = cells.size() - 1;
+    while (j > i + 1 && !lineOfSight(map, cells[i], cells[j])) {
+      --j;
+    }
+    kept.push_back(cells[j]);
+    i = j;
+  }
+  return kept;
+}
+
+std::vector<Eigen::Vector2d> resamplePolyline(const std::vector<Eigen::Vector2d>& points,
+                                              double step) {
+  if (points.size() < 2) {
+    return points;
+  }
+  std::vector<Eigen::Vector2d> out{points.front()};
+  double carry = 0.0;  // distance déjà parcourue depuis le dernier point émis
+  for (std::size_t i = 1; i < points.size(); ++i) {
+    const Eigen::Vector2d a = points[i - 1];
+    const Eigen::Vector2d seg = points[i] - a;
+    const double len = seg.norm();
+    double t = step - carry;  // position du prochain point sur ce segment
+    while (t < len) {
+      out.push_back(a + seg * (t / len));
+      t += step;
+    }
+    carry = len - (t - step);
+  }
+  if ((out.back() - points.back()).norm() > 1e-9) {
+    out.push_back(points.back());
+  }
+  return out;
+}
+
+Path makePath(const std::vector<Eigen::Vector2d>& points) {
+  Path path;
+  const std::size_t n = points.size();
+  path.points.resize(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    path.points[i].x = points[i].x();
+    path.points[i].y = points[i].y();
+    if (i > 0) {
+      path.points[i].s = path.points[i - 1].s + (points[i] - points[i - 1]).norm();
+    }
+  }
+  if (n < 2) {
+    return path;
+  }
+  // Cap = direction de la corde entre les voisins (différence centrée).
+  for (std::size_t i = 0; i < n; ++i) {
+    const Eigen::Vector2d d = points[std::min(i + 1, n - 1)] - points[i > 0 ? i - 1 : 0];
+    path.points[i].theta = std::atan2(d.y(), d.x());
+  }
+  // Courbure = variation du cap / variation de l'abscisse curviligne.
+  for (std::size_t i = 1; i + 1 < n; ++i) {
+    const double dtheta = wrapAngle(path.points[i + 1].theta - path.points[i - 1].theta);
+    const double ds = path.points[i + 1].s - path.points[i - 1].s;
+    path.points[i].curvature = ds > 1e-9 ? dtheta / ds : 0.0;
+  }
+  return path;
+}
+
+namespace {
+
+std::vector<Eigen::Vector2d> cellsToWorld(const OccupancyGrid& grid,
+                                          const std::vector<GridIndex>& cells) {
+  std::vector<Eigen::Vector2d> points;
+  for (const GridIndex& c : cells) {
+    points.push_back(grid.cellToWorld(c));
+  }
+  return points;
+}
+
+bool allPointsSafe(const CostMap& map, const std::vector<Eigen::Vector2d>& points) {
+  return std::none_of(points.begin(), points.end(),
+                      [&](const Eigen::Vector2d& p) { return map.lethalAt(p.x(), p.y()); });
+}
+
+// Descente de gradient sur chaque point intérieur (extrémités fixes) :
+//   p += w_data (q - p) + w_smooth (p_prev + p_next - 2 p) + w_obs (d0 - d) grad(d)
+// où q est le point d'origine et d la distance aux obstacles (si d < d0).
+// Un déplacement qui ferait entrer le point en zone létale est annulé.
+void gradientSmooth(const CostMap& map, std::vector<Eigen::Vector2d>& points,
+                    const SmootherConfig& cfg) {
+  const std::vector<Eigen::Vector2d> original = points;
+  for (int it = 0; it < cfg.iterations; ++it) {
+    for (std::size_t i = 1; i + 1 < points.size(); ++i) {
+      Eigen::Vector2d p = points[i];
+      p += cfg.w_data * (original[i] - p);
+      p += cfg.w_smooth * (points[i - 1] + points[i + 1] - 2.0 * points[i]);
+      const double d = map.distanceAt(p.x(), p.y());
+      if (d < cfg.obstacle_distance) {
+        const Eigen::Vector2d grad = map.distanceGradientAt(p.x(), p.y());
+        if (grad.norm() > 1e-9) {
+          p += cfg.w_obstacle * (cfg.obstacle_distance - d) * grad.normalized();
+        }
+      }
+      if (!map.lethalAt(p.x(), p.y())) {
+        points[i] = p;
+      }
+    }
+  }
+}
+
+}  // namespace
+
+Path smoothPath(const CostMap& map, const std::vector<GridIndex>& cells,
+                      const SmootherConfig& cfg) {
+  const OccupancyGrid& grid = map.grid();
+  // Densification à 2 cm : le lissage a besoin de points intermédiaires.
+  std::vector<Eigen::Vector2d> points =
+      resamplePolyline(cellsToWorld(grid, shortcutPath(map, cells)), 2.0 * cfg.resample_step);
+  gradientSmooth(map, points, cfg);
+  std::vector<Eigen::Vector2d> final_points = resamplePolyline(points, cfg.resample_step);
+  if (!allPointsSafe(map, final_points)) {
+    // Repli : chemin brut d'A* (centres de cellules non létales, sans coin coupé).
+    final_points = resamplePolyline(cellsToWorld(grid, cells), cfg.resample_step);
+  }
+  return makePath(final_points);
+}
+
+PlannerConfig loadPlannerConfig(const ConfigNode& root, double robot_radius) {
+  PlannerConfig cfg;
+  cfg.resolution = root.child("grid").getDouble("resolution", 0.002, 0.1);
+  cfg.inflation = loadInflationConfig(root.child("inflation"), robot_radius);
+  cfg.w_cost = root.child("astar").getDouble("w_cost", 0.0, 100.0);
+  cfg.smoother = loadSmootherConfig(root.child("smoothing"));
+  cfg.replan_deviation = root.child("replan").getDouble("max_deviation", 0.01, 1.0);
+  return cfg;
+}
+
+const char* toString(PlanStatus status) {
+  switch (status) {
+    case PlanStatus::Ok: return "OK";
+    case PlanStatus::GoalOutsideMap: return "BUT_HORS_CARTE";
+    case PlanStatus::GoalInObstacle: return "BUT_DANS_OBSTACLE";
+    case PlanStatus::StartTrapped: return "DEPART_BLOQUE";
+    case PlanStatus::NoPath: return "PAS_DE_CHEMIN";
+  }
+  return "?";
+}
+
+PlanResult planPath(const CostMap& map, const Pose2D& start, const Eigen::Vector2d& goal,
+                    std::optional<double> goal_heading, const PlannerConfig& config) {
+  PlanResult result;
+  const OccupancyGrid& grid = map.grid();
+  const GridIndex goal_cell = grid.worldToCell(goal.x(), goal.y());
+  if (!grid.inside(goal_cell)) {
+    result.status = PlanStatus::GoalOutsideMap;
+    return result;
+  }
+  if (map.lethal(goal_cell)) {
+    result.status = PlanStatus::GoalInObstacle;
+    return result;
+  }
+  // Départ en zone létale (fréquent en réel : bruit de pose près d'un mur) :
+  // on part de la cellule libre la plus proche.
+  GridIndex start_cell = grid.worldToCell(start.x, start.y);
+  if (map.lethal(start_cell)) {
+    GridIndex free_cell;
+    if (!nearestFreeCell(map, start_cell, free_cell)) {
+      result.status = PlanStatus::StartTrapped;
+      return result;
+    }
+    start_cell = free_cell;
+    result.start_escaped = true;
+  }
+  const GridSearchResult search = searchGrid(map, start_cell, goal_cell, config.w_cost);
+  if (!search.found) {
+    result.status = PlanStatus::NoPath;
+    return result;
+  }
+  result.raw_cells = search.cells;
+  result.path = smoothPath(map, search.cells, config.smoother);
+  // Le dernier point est le centre de la cellule but : on le remplace par le but
+  // exact (même cellule, donc non létal), sinon l'erreur finale peut atteindre 7 mm.
+  PathPoint& last = result.path.points.back();
+  last.s += std::hypot(goal.x() - last.x, goal.y() - last.y);
+  last.x = goal.x();
+  last.y = goal.y();
+  result.path.goal_heading = goal_heading;
+  result.status = PlanStatus::Ok;
+  return result;
+}
+
+bool pathBlocked(const CostMap& map, const Path& path, std::size_t from_index) {
+  for (std::size_t i = from_index; i < path.points.size(); ++i) {
+    if (map.lethalAt(path.points[i].x, path.points[i].y)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+double distanceToPath(const Path& path, double x, double y) {
+  if (path.points.empty()) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const Eigen::Vector2d p(x, y);
+  double best = (p - Eigen::Vector2d(path.points[0].x, path.points[0].y)).norm();
+  for (std::size_t i = 1; i < path.points.size(); ++i) {
+    const Eigen::Vector2d a(path.points[i - 1].x, path.points[i - 1].y);
+    const Eigen::Vector2d b(path.points[i].x, path.points[i].y);
+    const Eigen::Vector2d ab = b - a;
+    const double len2 = ab.squaredNorm();
+    const double t = len2 > 0.0 ? std::clamp((p - a).dot(ab) / len2, 0.0, 1.0) : 0.0;
+    best = std::min(best, (p - (a + t * ab)).norm());
+  }
+  return best;
+}

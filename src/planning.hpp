@@ -111,3 +111,116 @@ class CostMap {
 
   const OccupancyGrid& grid() const { return grid_; }
   const InflationConfig& config() const { return config_; }
+
+  std::uint8_t cost(const GridIndex& c) const { return costs_[grid_.linear(c)]; }
+  // Hors grille = létal.
+  bool lethal(const GridIndex& c) const { return !grid_.inside(c) || cost(c) >= kLethalCost; }
+  bool lethalAt(double x, double y) const { return lethal(grid_.worldToCell(x, y)); }
+  // Distance au plus proche obstacle (m).
+  double distance(const GridIndex& c) const { return distances_[grid_.linear(c)]; }
+  // Distance au plus proche obstacle au point (x, y) ; 0 hors de la grille.
+  double distanceAt(double x, double y) const;
+  // Gradient de la distance (différences centrées), pointe à l'opposé des obstacles.
+  Eigen::Vector2d distanceGradientAt(double x, double y) const;
+
+ private:
+  OccupancyGrid grid_;
+  InflationConfig config_;
+  std::vector<double> distances_;     // m
+  std::vector<std::uint8_t> costs_;   // 0..254
+};
+
+// Recherche de chemin sur la grille : A* à 8 voisins.
+//
+//   coût d'un pas = longueur du pas (m) * (1 + w_cost * c / 253)
+//   heuristique   = distance octile (m), admissible car le facteur de coût est >= 1
+//
+// Un pas en diagonale est interdit s'il "coupe le coin" d'une cellule létale.
+
+struct GridSearchResult {
+  bool found = false;
+  std::vector<GridIndex> cells;  // du départ au but inclus
+  double cost = 0.0;             // somme des coûts de pas
+  int expanded = 0;              // nombre de cellules développées (pour comparer A* et Dijkstra)
+};
+
+// A* ; avec use_heuristic = false, c'est l'algorithme de Dijkstra (même code).
+GridSearchResult searchGrid(const CostMap& map, const GridIndex& start, const GridIndex& goal,
+                            double w_cost, bool use_heuristic = true);
+
+// Distance octile entre deux cellules, en cellules : max + (sqrt(2) - 1) * min.
+double octileDistance(const GridIndex& a, const GridIndex& b);
+
+// Recherche en largeur de la cellule non létale la plus proche (départ en zone
+// létale). Renvoie false si aucune n'existe.
+bool nearestFreeCell(const CostMap& map, const GridIndex& start, GridIndex& free_cell);
+
+// Post-traitement du chemin A* :
+//  1) raccourcis par ligne de vue (Bresenham sur les cellules létales) ;
+//  2) densification puis lissage par descente de gradient ;
+//  3) rééchantillonnage tous les "step" mètres, calcul du cap et de la courbure.
+// Garantie : aucun point du résultat n'est en zone létale (sinon repli sur le chemin brut).
+
+struct SmootherConfig {
+  double w_data = 0.1;          // attache aux points d'origine
+  double w_smooth = 0.3;        // lissage (rapproche chaque point du milieu de ses voisins)
+  double w_obstacle = 0.3;      // éloignement des obstacles
+  double obstacle_distance = 0.15;  // les obstacles plus loin que ça n'agissent pas (m)
+  int iterations = 100;
+  double resample_step = 0.01;  // (m)
+};
+
+SmootherConfig loadSmootherConfig(const ConfigNode& section);
+
+// Vrai si le segment a-b ne traverse aucune cellule létale (tracé de Bresenham).
+bool lineOfSight(const CostMap& map, const GridIndex& a, const GridIndex& b);
+
+// Garde seulement les cellules nécessaires : depuis chaque point, on saute au
+// point le plus lointain encore visible.
+std::vector<GridIndex> shortcutPath(const CostMap& map, const std::vector<GridIndex>& cells);
+
+// Rééchantillonne une polyligne tous les "step" mètres (extrémités conservées).
+std::vector<Eigen::Vector2d> resamplePolyline(const std::vector<Eigen::Vector2d>& points,
+                                              double step);
+
+// Calcule s, cap et courbure de chaque point.
+Path makePath(const std::vector<Eigen::Vector2d>& points);
+
+// Toute la chaîne : cellules A* -> chemin lisse et sûr.
+Path smoothPath(const CostMap& map, const std::vector<GridIndex>& cells,
+                      const SmootherConfig& config);
+
+// Planificateur complet : A* + lissage, gestion du départ en zone létale,
+// et tests de replanification.
+
+struct PlannerConfig {
+  double resolution = 0.01;
+  InflationConfig inflation;
+  double w_cost = 2.0;
+  SmootherConfig smoother;
+  double replan_deviation = 0.10;  // écart au chemin qui déclenche une replanification (m)
+};
+
+// Lit params.yaml (planning) ; le rayon du robot vient de robot.yaml.
+PlannerConfig loadPlannerConfig(const ConfigNode& root, double robot_radius);
+
+enum class PlanStatus { Ok, GoalOutsideMap, GoalInObstacle, StartTrapped, NoPath };
+
+const char* toString(PlanStatus status);
+
+struct PlanResult {
+  PlanStatus status = PlanStatus::NoPath;
+  Path path;
+  bool start_escaped = false;          // le départ était en zone létale (journaliser)
+  std::vector<GridIndex> raw_cells;    // chemin A* brut (affichage)
+  bool ok() const { return status == PlanStatus::Ok; }
+};
+
+PlanResult planPath(const CostMap& map, const Pose2D& start, const Eigen::Vector2d& goal,
+                    std::optional<double> goal_heading, const PlannerConfig& config);
+
+// Vrai si un point du chemin, à partir de from_index, est devenu létal.
+bool pathBlocked(const CostMap& map, const Path& path, std::size_t from_index);
+
+// Distance du point au chemin (au segment le plus proche), en m.
+double distanceToPath(const Path& path, double x, double y);
