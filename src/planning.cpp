@@ -176,3 +176,181 @@ std::vector<double> euclideanDistanceTransform(const OccupancyGrid& grid) {
   f.resize(rows);
   for (int col = 0; col < cols; ++col) {
     for (int row = 0; row < rows; ++row) f[row] = sq[row * cols + col];
+    squaredDistance1D(f, d);
+    for (int row = 0; row < rows; ++row) sq[row * cols + col] = d[row];
+  }
+  f.resize(cols);
+  for (int row = 0; row < rows; ++row) {
+    for (int col = 0; col < cols; ++col) f[col] = sq[row * cols + col];
+    squaredDistance1D(f, d);
+    for (int col = 0; col < cols; ++col) sq[row * cols + col] = std::sqrt(d[col]);
+  }
+  return sq;
+}
+
+CostMap::CostMap(const OccupancyGrid& grid, const InflationConfig& config)
+    : grid_(grid), config_(config) {
+  distances_ = euclideanDistanceTransform(grid);
+  costs_.resize(distances_.size());
+  const double r = config.robot_radius + config.margin;
+  for (std::size_t i = 0; i < distances_.size(); ++i) {
+    const double dist = distances_[i] * grid.resolution();
+    distances_[i] = dist;
+    if (dist <= r) {
+      costs_[i] = kLethalCost;
+    } else if (dist >= config.d_max) {
+      costs_[i] = 0;
+    } else {
+      costs_[i] = static_cast<std::uint8_t>(kMaxNonLethalCost * std::exp(-config.alpha * (dist - r)));
+    }
+  }
+}
+
+double CostMap::distanceAt(double x, double y) const {
+  const GridIndex c = grid_.worldToCell(x, y);
+  return grid_.inside(c) ? distance(c) : 0.0;
+}
+
+Eigen::Vector2d CostMap::distanceGradientAt(double x, double y) const {
+  const double h = grid_.resolution();
+  const double gx = (distanceAt(x + h, y) - distanceAt(x - h, y)) / (2.0 * h);
+  const double gy = (distanceAt(x, y + h) - distanceAt(x, y - h)) / (2.0 * h);
+  return {gx, gy};
+}
+
+namespace {
+constexpr double kSqrt2 = 1.41421356237309504880;
+
+// Les 8 voisins : 4 orthogonaux puis 4 diagonaux.
+constexpr int kDcol[8] = {1, -1, 0, 0, 1, 1, -1, -1};
+constexpr int kDrow[8] = {0, 0, 1, -1, 1, -1, 1, -1};
+
+// Un pas diagonal ne doit pas passer entre deux cellules dont l'une est létale.
+bool cutsCorner(const CostMap& map, const GridIndex& from, int dcol, int drow) {
+  if (dcol == 0 || drow == 0) {
+    return false;
+  }
+  return map.lethal({from.col + dcol, from.row}) || map.lethal({from.col, from.row + drow});
+}
+
+std::vector<GridIndex> rebuildPath(const OccupancyGrid& grid, const std::vector<int>& parent,
+                                   int goal) {
+  std::vector<GridIndex> cells;
+  for (int i = goal; i != -1; i = parent[i]) {
+    cells.push_back(grid.fromLinear(i));
+  }
+  std::reverse(cells.begin(), cells.end());
+  return cells;
+}
+}  // namespace
+
+double octileDistance(const GridIndex& a, const GridIndex& b) {
+  const int dx = std::abs(a.col - b.col);
+  const int dy = std::abs(a.row - b.row);
+  return std::max(dx, dy) + (kSqrt2 - 1.0) * std::min(dx, dy);
+}
+
+GridSearchResult searchGrid(const CostMap& map, const GridIndex& start, const GridIndex& goal,
+                            double w_cost, bool use_heuristic) {
+  GridSearchResult result;
+  if (map.lethal(start) || map.lethal(goal)) {
+    return result;
+  }
+  const OccupancyGrid& grid = map.grid();
+  const double res = grid.resolution();
+  const int n = grid.cols() * grid.rows();
+  std::vector<double> g(n, std::numeric_limits<double>::infinity());  // meilleur coût connu
+  std::vector<int> parent(n, -1);
+  std::vector<bool> closed(n, false);
+
+  // File de priorité (f = g + h, indice) ; les entrées périmées sont ignorées
+  // à la sortie grâce au tableau "closed" (plus simple qu'une mise à jour de clé).
+  using Entry = std::pair<double, int>;
+  std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> open;
+  const int start_i = grid.linear(start);
+  const int goal_i = grid.linear(goal);
+  g[start_i] = 0.0;
+  open.push({use_heuristic ? res * octileDistance(start, goal) : 0.0, start_i});
+
+  while (!open.empty()) {
+    const int current = open.top().second;
+    open.pop();
+    if (closed[current]) {
+      continue;
+    }
+    closed[current] = true;
+    ++result.expanded;
+    if (current == goal_i) {
+      result.found = true;
+      result.cost = g[goal_i];
+      result.cells = rebuildPath(grid, parent, goal_i);
+      return result;
+    }
+    const GridIndex c = grid.fromLinear(current);
+    for (int k = 0; k < 8; ++k) {
+      const GridIndex next{c.col + kDcol[k], c.row + kDrow[k]};
+      if (map.lethal(next) || cutsCorner(map, c, kDcol[k], kDrow[k])) {
+        continue;
+      }
+      const int ni = grid.linear(next);
+      if (closed[ni]) {
+        continue;
+      }
+      const double length = (k < 4 ? 1.0 : kSqrt2) * res;
+      const double step = length * (1.0 + w_cost * map.cost(next) / kMaxNonLethalCost);
+      if (g[current] + step < g[ni]) {
+        g[ni] = g[current] + step;
+        parent[ni] = current;
+        const double h = use_heuristic ? res * octileDistance(next, goal) : 0.0;
+        open.push({g[ni] + h, ni});
+      }
+    }
+  }
+  return result;  // pas de chemin
+}
+
+bool nearestFreeCell(const CostMap& map, const GridIndex& start, GridIndex& free_cell) {
+  const OccupancyGrid& grid = map.grid();
+  if (!grid.inside(start)) {
+    return false;
+  }
+  std::vector<bool> seen(grid.cols() * grid.rows(), false);
+  std::queue<GridIndex> queue;
+  queue.push(start);
+  seen[grid.linear(start)] = true;
+  while (!queue.empty()) {
+    const GridIndex c = queue.front();
+    queue.pop();
+    if (!map.lethal(c)) {
+      free_cell = c;
+      return true;
+    }
+    for (int k = 0; k < 8; ++k) {
+      const GridIndex next{c.col + kDcol[k], c.row + kDrow[k]};
+      if (grid.inside(next) && !seen[grid.linear(next)]) {
+        seen[grid.linear(next)] = true;
+        queue.push(next);
+      }
+    }
+  }
+  return false;
+}
+
+SmootherConfig loadSmootherConfig(const ConfigNode& section) {
+  SmootherConfig cfg;
+  cfg.w_data = section.getDouble("w_data", 0.0, 1.0);
+  cfg.w_smooth = section.getDouble("w_smooth", 0.0, 0.5);
+  cfg.w_obstacle = section.getDouble("w_obstacle", 0.0, 1.0);
+  cfg.obstacle_distance = section.getDouble("obstacle_distance", 0.0, 1.0);
+  cfg.iterations = section.getInt("iterations", 0, 10000);
+  cfg.resample_step = section.getDouble("resample_step", 0.001, 0.1);
+  return cfg;
+}
+
+bool lineOfSight(const CostMap& map, const GridIndex& a, const GridIndex& b) {
+  // Bresenham généralisé à toutes les directions : on avance d'une cellule à la
+  // fois sur l'axe principal, et l'erreur accumulée décide quand bouger sur l'autre.
+  int col = a.col, row = a.row;
+  const int dcol = std::abs(b.col - a.col), drow = -std::abs(b.row - a.row);
+  const int step_col = a.col < b.col ? 1 : -1;
+  const int step_row = a.row < b.row ? 1 : -1;
