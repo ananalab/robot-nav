@@ -220,3 +220,225 @@ TEST(SimWorld, RotationInPlaceMatchesAnalyticRate) {
   SimWorld world(idealWorld());
   world.setCommand({-0.7, 0.7});
   world.advanceTo(2.0);  // 19 tau après le retard : régime permanent atteint
+  // omega = (vR - vL) / b avec vR = -vL = 0.6 * (0.7 - 0.35)
+  const double wheel = 0.6 * (0.7 - 0.35);
+  const double expected_omega = 2.0 * wheel / 0.13;
+  EXPECT_NEAR(world.groundTruthTwist().omega, expected_omega, 1e-6);
+  EXPECT_NEAR(world.groundTruthTwist().v, 0.0, 1e-12);
+  const Pose2D p = world.groundTruthPose();
+  EXPECT_NEAR(p.x, 0.0, 1e-9);
+  EXPECT_NEAR(p.y, 0.0, 1e-9);
+}
+
+TEST(SimWorld, CommandDelayIsRespected) {
+  SimWorld world(idealWorld());
+  world.setCommand({1.0, 1.0});
+  world.advanceTo(0.049);
+  EXPECT_DOUBLE_EQ(world.groundTruthPose().x, 0.0);
+  world.advanceTo(0.1);
+  EXPECT_GT(world.groundTruthPose().x, 0.0);
+}
+
+TEST(SimWorld, DeadzoneKeepsRobotStill) {
+  SimWorld world(idealWorld());
+  world.setCommand({0.3, 0.3});  // sous u0 = 0.35
+  world.advanceTo(2.0);
+  EXPECT_DOUBLE_EQ(world.groundTruthPose().x, 0.0);
+  EXPECT_DOUBLE_EQ(world.motorOnTime() > 0.0, true);
+}
+
+TEST(SimWorld, DeterministicWithSameSeed) {
+  SimWorldConfig cfg = idealWorld();
+  cfg.slip_sigma = 0.1;
+  cfg.seed = 7;
+  SimWorld a(cfg), b(cfg);
+  cfg.seed = 8;
+  SimWorld c(cfg);
+  for (SimWorld* w : {&a, &b, &c}) {
+    w->setCommand({0.9, 0.6});
+    w->advanceTo(2.0);
+  }
+  EXPECT_DOUBLE_EQ(a.groundTruthPose().x, b.groundTruthPose().x);
+  EXPECT_DOUBLE_EQ(a.groundTruthPose().y, b.groundTruthPose().y);
+  EXPECT_DOUBLE_EQ(a.groundTruthPose().theta, b.groundTruthPose().theta);
+  EXPECT_NE(a.groundTruthPose().x, c.groundTruthPose().x);
+}
+
+TEST(SimWorld, CollisionBlocksRobotAndCountsOnce) {
+  SimWorldConfig cfg = idealWorld();
+  cfg.obstacles.push_back(Box{0.5, 0.0, 0.1, 0.4, 0.06, 0.0, "red"});
+  SimWorld world(cfg);
+  world.setCommand({1.0, 1.0});
+  world.advanceTo(5.0);
+  // Le robot (rayon 0.1) s'arrête contre la face x = 0.45 de la boîte.
+  EXPECT_NEAR(world.groundTruthPose().x, 0.35, 0.005);
+  EXPECT_EQ(world.collisionCount(), 1);
+  EXPECT_TRUE(world.inContact());
+}
+
+TEST(SimWorld, BatterySagReducesSpeed) {
+  SimWorldConfig cfg = idealWorld();
+  cfg.battery_sag = 0.5;
+  cfg.battery_duration = 2.0;
+  SimWorld world(cfg);
+  world.setCommand({1.0, 1.0});
+  world.advanceTo(2.0);
+  // En fin de batterie, la vitesse est divisée par 2.
+  EXPECT_NEAR(world.groundTruthTwist().v, 0.5 * 0.6 * 0.65, 0.01);
+}
+
+TEST(DiscTouchesBox, RotatedBox) {
+  const Box box{0.0, 0.0, 0.2, 0.02, 0.06, kPi / 4, "red"};  // fine planche à 45°
+  EXPECT_TRUE(discTouchesBox(0.05, 0.05, 0.01, box));    // sur la diagonale
+  EXPECT_FALSE(discTouchesBox(0.05, -0.05, 0.01, box));  // de l'autre côté
+}
+
+TEST(SimWorld, ProjectConfigLoads) {
+  const std::string dir = std::string(RN_SOURCE_DIR) + "/config/";
+  const auto robot = loadRobotConfig(ConfigNode::loadFile(dir + "robot.yaml").child("robot"));
+  const auto arena = loadArenaConfig(ConfigNode::loadFile(dir + "robot.yaml").child("arena"));
+  const auto cfg = loadSimWorldConfig(ConfigNode::loadFile(dir + "params.yaml").child("sim"), robot, arena);
+  EXPECT_EQ(cfg.arena.floor_tags.size(), 4u);
+  EXPECT_FALSE(cfg.obstacles.empty());
+  // Les vrais moteurs de la sim ne sont pas ceux de robot.yaml.
+  EXPECT_NE(cfg.robot.left.gain, robot.left.gain);
+}
+
+
+namespace {
+WheelMapperConfig mapperConfig() {
+  WheelMapperConfig cfg;
+  cfg.wheel_base = 0.13;
+  cfg.left = {0.6, 0.35};
+  cfg.right = {0.66, 0.30};
+  cfg.min_wheel_speed = 0.03;
+  cfg.start_speed = 0.015;
+  cfg.stop_speed = 0.006;
+  return cfg;
+}
+}  // namespace
+
+// ------------------------------------------------------------ modèle moteur
+TEST(MotorModel, InverseOfForwardGivesBackCommand) {
+  const MotorParams motor{0.6, 0.35};
+  for (double u = 0.36; u <= 1.0; u += 0.01) {
+    for (double sign : {1.0, -1.0}) {
+      const double v = wheelSpeedFromCommand(motor, sign * u);
+      const double u_back = commandFromWheelSpeed(motor, v);
+      EXPECT_NEAR(u_back, sign * u, 0.01 * u) << "u = " << sign * u;
+    }
+  }
+}
+
+TEST(MotorModel, DeadzoneAndSaturation) {
+  const MotorParams motor{0.6, 0.35};
+  EXPECT_DOUBLE_EQ(wheelSpeedFromCommand(motor, 0.2), 0.0);
+  EXPECT_DOUBLE_EQ(commandFromWheelSpeed(motor, 0.0), 0.0);
+  EXPECT_DOUBLE_EQ(commandFromWheelSpeed(motor, 10.0), 1.0);
+  EXPECT_DOUBLE_EQ(commandFromWheelSpeed(motor, -10.0), -1.0);
+}
+
+// ------------------------------------------------------------ WheelMapper
+TEST(WheelMapper, StraightAndRotation) {
+  WheelMapper mapper(mapperConfig());
+  mapper.map({0.2, 0.0});
+  EXPECT_DOUBLE_EQ(mapper.lastLeftSpeed(), 0.2);
+  EXPECT_DOUBLE_EQ(mapper.lastRightSpeed(), 0.2);
+  mapper.map({0.0, 2.0});
+  EXPECT_NEAR(mapper.lastLeftSpeed(), -0.13, 1e-12);
+  EXPECT_NEAR(mapper.lastRightSpeed(), 0.13, 1e-12);
+}
+
+TEST(WheelMapper, SaturationKeepsCurvature) {
+  WheelMapper mapper(mapperConfig());
+  const Twist2D wanted{1.0, 3.0};  // bien trop rapide
+  const WheelCmd cmd = mapper.map(wanted);
+  const double vl = mapper.lastLeftSpeed();
+  const double vr = mapper.lastRightSpeed();
+  const double v = (vl + vr) / 2.0;
+  const double omega = (vr - vl) / 0.13;
+  EXPECT_NEAR(omega / v, wanted.omega / wanted.v, 1e-9);  // même courbure
+  EXPECT_LE(std::abs(cmd.left), 1.0);
+  EXPECT_LE(std::abs(cmd.right), 1.0);
+  EXPECT_NEAR(std::max(std::abs(cmd.left), std::abs(cmd.right)), 1.0, 1e-9);
+}
+
+TEST(WheelMapper, CommandRoundTripsThroughModel) {
+  WheelMapper mapper(mapperConfig());
+  const WheelCmd cmd = mapper.map({0.15, 0.5});
+  EXPECT_NEAR(wheelSpeedFromCommand(mapperConfig().left, cmd.left), 0.15 - 0.5 * 0.065,
+              1e-9);
+  EXPECT_NEAR(wheelSpeedFromCommand(mapperConfig().right, cmd.right), 0.15 + 0.5 * 0.065,
+              1e-9);
+}
+
+TEST(WheelMapper, DeadzoneHysteresis) {
+  WheelMapper mapper(mapperConfig());
+  // Roue arrêtée : 1 cm/s est sous le seuil de démarrage (1.5 cm/s) -> reste à 0.
+  mapper.map({0.01, 0.0});
+  EXPECT_DOUBLE_EQ(mapper.lastLeftSpeed(), 0.0);
+  // 2 cm/s : démarre, et la vitesse est portée au minimum fiable (3 cm/s).
+  mapper.map({0.02, 0.0});
+  EXPECT_DOUBLE_EQ(mapper.lastLeftSpeed(), 0.03);
+  // En marche, 1 cm/s reste au minimum (pas d'arrêt avant le seuil d'arrêt).
+  mapper.map({0.01, 0.0});
+  EXPECT_DOUBLE_EQ(mapper.lastLeftSpeed(), 0.03);
+  // 0.5 cm/s : sous le seuil d'arrêt -> arrêt.
+  mapper.map({0.005, 0.0});
+  EXPECT_DOUBLE_EQ(mapper.lastLeftSpeed(), 0.0);
+  // Consigne nulle -> commande exactement nulle.
+  const WheelCmd cmd = mapper.map({0.0, 0.0});
+  EXPECT_DOUBLE_EQ(cmd.left, 0.0);
+  EXPECT_DOUBLE_EQ(cmd.right, 0.0);
+}
+
+TEST(WheelMapper, ProjectConfigLoads) {
+  const std::string dir = std::string(RN_SOURCE_DIR) + "/config/";
+  const auto robot = loadRobotConfig(ConfigNode::loadFile(dir + "robot.yaml").child("robot"));
+  const auto cfg = loadWheelMapperConfig(
+      robot, ConfigNode::loadFile(dir + "params.yaml").child("control").child("wheel_mapper"));
+  EXPECT_LE(cfg.stop_speed, cfg.start_speed);
+  EXPECT_LE(cfg.start_speed, cfg.min_wheel_speed);
+}
+
+// ------------------------------------------------------------ Pure Pursuit
+
+namespace {
+Path straightPath(double length) {
+  Path path;
+  for (int i = 0; i <= static_cast<int>(length * 100); ++i) {
+    PathPoint p;
+    p.x = i * 0.01;
+    p.s = p.x;
+    path.points.push_back(p);
+  }
+  return path;
+}
+PurePursuit makePurePursuit() {
+  PurePursuitConfig cfg;
+  cfg.lookahead_gain = 0.0;  // L = L0 = 0.1 m pour vérifier la formule
+  cfg.lookahead_base = 0.1;
+  cfg.lookahead_min = 0.05;
+  cfg.lookahead_max = 0.2;
+  return PurePursuit(cfg, ControlLimits{}, RotationConfig{});
+}
+}  // namespace
+
+TEST(PurePursuit, CurvatureFormulaOnStraightPath) {
+  auto pp = makePurePursuit();
+  const Path path = straightPath(1.0);
+  // Robot à 2 cm à gauche du chemin, aligné : le point visé est à 10 cm devant
+  // sur le chemin, alpha = atan2(-0.02, 0.1) environ, kappa = 2 sin(alpha) / d.
+  const Pose2D est{0.0, 0.02, 0.0};
+  pp.compute(est, {}, path, 0.0);                    // 1er appel : initialise l'état
+  const Twist2D cmd = pp.compute(est, {0.1, 0.0}, path, 1.0);
+  EXPECT_EQ(pp.state(), ControlState::Tracking);
+  const double d = std::hypot(0.1, 0.02);
+  const double kappa = 2.0 * std::sin(std::atan2(-0.02, 0.1)) / d;
+  ASSERT_GT(cmd.v, 0.0);
+  EXPECT_NEAR(cmd.omega / cmd.v, kappa, 0.05 * std::abs(kappa));
+  EXPECT_LT(cmd.omega, 0.0);  // tourne vers la droite, vers le chemin
+}
+
+TEST(PurePursuit, RotatesFirstWhenFacingAway) {
+  auto pp = makePurePursuit();
