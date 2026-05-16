@@ -206,3 +206,211 @@ Twist2D PurePursuit::compute(const Pose2D& est, const Twist2D& vel,
     last_cmd_ = {};
     return {};
   }
+  if (state_ == ControlState::Arrived || state_ == ControlState::Stopped) {
+    last_cmd_ = {};
+    return {};
+  }
+  index_ = closestPointForward(path, est, index_, config_.search_window);
+  debug_.path_index = index_;
+  debug_.lateral_error = lateralError(path, index_, est);
+
+  const PathPoint& goal = path.points.back();
+  const double distance_to_goal = std::hypot(goal.x - est.x, goal.y - est.y);
+  if (distance_to_goal < config_.stop_distance || final_phase_) {
+    final_phase_ = true;  // une fois arrivé en position, on ne repart plus en suivi
+    bool arrived = false;
+    last_cmd_ = finalAlignment(est, vel, path, rotation_, limits_, arrived);
+    state_ = arrived ? ControlState::Arrived : ControlState::Rotating;
+    last_time_ = t;
+    return last_cmd_;
+  }
+
+  // Pré-rotation : si le robot regarde trop loin de la tangente du chemin, il
+  // tourne d'abord sur place (sauf tout près du but, où l'on veut juste finir).
+  const double heading_error = wrapAngle(path.points[index_].theta - est.theta);
+  const bool near_goal = distance_to_goal < config_.lookahead_min;
+  if (!started_) {
+    state_ = std::abs(heading_error) > rotation_.start_threshold ? ControlState::Rotating
+                                                                  : ControlState::Tracking;
+    started_ = true;
+  } else if (state_ == ControlState::Tracking && !near_goal &&
+             std::abs(heading_error) > rotation_.start_threshold) {
+    state_ = ControlState::Rotating;
+  } else if (state_ == ControlState::Rotating && std::abs(heading_error) < rotation_.stop_threshold) {
+    state_ = ControlState::Tracking;
+  }
+
+  Twist2D cmd = state_ == ControlState::Rotating
+                          ? rotateTowards(path.points[index_].theta, est, vel, rotation_)
+                          : track(est, vel, path, distance_to_goal);
+  last_cmd_ = applyLimits(cmd, t);
+  return last_cmd_;
+}
+
+Twist2D PurePursuit::track(const Pose2D& est, const Twist2D& vel,
+                                 const Path& path, double distance_to_goal) {
+  // Distance d'anticipation : plus on va vite, plus on regarde loin.
+  const double lookahead = std::clamp(config_.lookahead_base + config_.lookahead_gain * std::abs(vel.v),
+                                      config_.lookahead_min, config_.lookahead_max);
+  std::size_t target = index_;
+  const double s_target = path.points[index_].s + lookahead;
+  while (target + 1 < path.points.size() && path.points[target].s < s_target) {
+    ++target;
+  }
+  const PathPoint& p = path.points[target];
+  debug_.lookahead = {p.x, p.y};
+
+  // Point visé exprimé dans le repère du robot.
+  const Pose2D local = compose(inverse(est), Pose2D{p.x, p.y, 0.0});
+  const double d = std::max(std::hypot(local.x, local.y), 1e-6);
+
+  // But dépassé (il est derrière nous, tout près) : on recule au lieu de faire demi-tour.
+  const bool reverse = local.x < 0.0 && distance_to_goal < config_.lookahead_min &&
+                       target + 1 == path.points.size();
+  const double alpha = reverse ? std::atan2(-local.y, -local.x) : std::atan2(local.y, local.x);
+  const double kappa = 2.0 * std::sin(alpha) / d;
+
+  // Vitesse : limite globale, accélération latérale dans les virages, freinage avant le but.
+  double speed = std::min(limits_.v_max, std::sqrt(2.0 * config_.decel * distance_to_goal));
+  speed = std::min(speed, config_.approach_gain * distance_to_goal);
+  if (std::abs(kappa) > 1e-6) {
+    speed = std::min(speed, std::sqrt(config_.lateral_accel_max / std::abs(kappa)));
+  }
+  return {reverse ? -speed : speed, speed * kappa};
+}
+
+Twist2D PurePursuit::applyLimits(Twist2D cmd, Time t) {
+  // omega trop grand : on réduit v et omega ensemble (même courbure).
+  if (std::abs(cmd.omega) > limits_.omega_max) {
+    const double scale = limits_.omega_max / std::abs(cmd.omega);
+    cmd.v *= scale;
+    cmd.omega *= scale;
+  }
+  // Accélérations limitées ; les décélérations restent immédiates (sécurité).
+  const double dt = last_time_ < 0.0 ? 0.0 : std::max(0.0, t - last_time_);
+  last_time_ = t;
+  if (std::abs(cmd.v) > std::abs(last_cmd_.v)) {
+    cmd.v = rateLimit(cmd.v, last_cmd_.v, limits_.accel_max, dt);
+  }
+  if (std::abs(cmd.omega) > std::abs(last_cmd_.omega)) {
+    cmd.omega = rateLimit(cmd.omega, last_cmd_.omega, limits_.alpha_max, dt);
+  }
+  return cmd;
+}
+
+namespace {
+constexpr double kLethal = 254.0;
+constexpr double kAbandoned = 1e6;  // coût d'un échantillon qui touche un obstacle
+constexpr int kDrawnSamples = 20;   // trajectoires gardées pour l'affichage
+constexpr double kLethalStepPenalty = 100.0;  // pas létal quand le départ l'est déjà
+}  // namespace
+
+MppiConfig loadMppiConfig(const ConfigNode& s, double tau, unsigned seed) {
+  MppiConfig c;
+  c.horizon = s.getDouble("horizon", 0.1, 10.0);
+  c.dt = s.getDouble("dt", 0.005, 0.5);
+  c.samples = s.getInt("samples", 8, 100000);
+  c.sigma_v = s.getDouble("sigma_v", 0.0, 1.0);
+  c.sigma_omega = s.getDouble("sigma_omega", 0.0, 10.0);
+  c.lambda = s.getDouble("lambda", 1e-4, 1e4);
+  c.w_path = s.getDouble("w_path", 0.0, 1e6);
+  c.w_obstacle = s.getDouble("w_obstacle", 0.0, 1e6);
+  c.w_dcmd = s.getDouble("w_dcmd", 0.0, 1e6);
+  c.w_heading = s.getDouble("w_heading", 0.0, 1e6);
+  c.w_speed = s.getDouble("w_speed", 0.0, 1e6);
+  c.w_terminal = s.getDouble("w_terminal", 0.0, 1e6);
+  c.v_min = s.getDouble("v_min", -1.0, 0.0);
+  c.handover_distance = s.getDouble("handover_distance", 0.0, 1.0);
+  c.tau_v = tau;
+  c.tau_omega = tau;
+  c.seed = seed;
+  return c;
+}
+
+Mppi::Mppi(const MppiConfig& config, const PurePursuitConfig& speed_profile,
+           const ControlLimits& limits, const RotationConfig& rotation, const CostMap* costmap)
+    : config_(config), speed_(speed_profile), limits_(limits), rotation_(rotation),
+      costmap_(costmap), rng_(config.seed),
+      finisher_(speed_profile, limits, rotation) {}
+
+void Mppi::reset() {
+  state_ = ControlState::Rotating;
+  index_ = 0;
+  started_ = false;
+  handed_over_ = false;
+  finisher_.reset();
+  nominal_.clear();
+  debug_ = {};
+}
+
+double Mppi::obstacleCost(double x, double y) const {
+  const GridIndex c = costmap_->grid().worldToCell(x, y);
+  return costmap_->lethal(c) ? kLethal : costmap_->cost(c);
+}
+
+double Mppi::referenceSpeed(double distance_to_goal) const {
+  // Même profil de vitesse que Pure Pursuit : freinage avant le but, approche lente.
+  return std::min({limits_.v_max, std::sqrt(2.0 * speed_.decel * distance_to_goal),
+                   speed_.approach_gain * distance_to_goal});
+}
+
+Twist2D Mppi::compute(const Pose2D& est, const Twist2D& vel,
+                            const Path& path, Time t) {
+  if (path.empty()) {
+    state_ = ControlState::Stopped;
+    return {};
+  }
+  if (state_ == ControlState::Arrived || state_ == ControlState::Stopped) return {};
+  const PathPoint& goal = path.points.back();
+  const double distance_to_goal = std::hypot(goal.x - est.x, goal.y - est.y);
+  if (distance_to_goal < config_.handover_distance || handed_over_) {
+    // Approche finale par Pure Pursuit (une fois commencée, on ne revient pas à MPPI).
+    handed_over_ = true;
+    last_cmd_ = finisher_.compute(est, vel, path, t);
+    state_ = finisher_.state();
+    debug_ = finisher_.debug();
+    return last_cmd_;
+  }
+  index_ = closestPointForward(path, est, index_, speed_.search_window);
+  debug_.path_index = index_;
+  debug_.lateral_error = lateralError(path, index_, est);
+
+  // Pré-rotation sur place, comme Pure Pursuit (MPPI gère mal les demi-tours sur place).
+  const double heading_error = wrapAngle(path.points[index_].theta - est.theta);
+  if (!started_) {
+    state_ = std::abs(heading_error) > rotation_.start_threshold ? ControlState::Rotating
+                                                                  : ControlState::Tracking;
+    started_ = true;
+  } else if (state_ != ControlState::Rotating && std::abs(heading_error) > rotation_.start_threshold) {
+    state_ = ControlState::Rotating;
+  } else if (state_ == ControlState::Rotating && std::abs(heading_error) < rotation_.stop_threshold) {
+    state_ = ControlState::Tracking;
+    nominal_.clear();
+  }
+  last_cmd_ = state_ == ControlState::Rotating
+                  ? rotateTowards(path.points[index_].theta, est, vel, rotation_)
+                  : optimize(est, vel, path, t);
+  return last_cmd_;
+}
+
+std::vector<Eigen::Vector2d> Mppi::rollout(const Eigen::Matrix<double, 5, 1>& x0,
+                                           const std::vector<Twist2D>& u) const {
+  std::vector<Eigen::Vector2d> points;
+  Vector5d x = x0;
+  for (const Twist2D& cmd : u) {
+    x = motionModel(x, cmd, config_.dt, config_.tau_v, config_.tau_omega);
+    points.emplace_back(x(0), x(1));
+  }
+  return points;
+}
+
+Twist2D Mppi::optimize(const Pose2D& est, const Twist2D& vel, const Path& path, Time t) {
+  const int steps = static_cast<int>(std::lround(config_.horizon / config_.dt));
+  const int samples = config_.samples;
+  // Démarrage à chaud : la séquence du cycle précédent, décalée d'un pas.
+  if (static_cast<int>(nominal_.size()) != steps) {
+    nominal_.assign(steps, {std::max(0.0, vel.v), vel.omega});
+  } else {
+    nominal_.erase(nominal_.begin());
+    nominal_.push_back(nominal_.back());
+  }

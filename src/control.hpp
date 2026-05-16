@@ -124,3 +124,129 @@ class WheelMapper {
 };
 
 // Pure Pursuit : le robot vise un point du chemin situé à une distance
+// d'anticipation L devant lui, et suit l'arc de cercle qui y mène.
+//
+//   L = clamp(L0 + k_v |v|, L_min, L_max)
+//   alpha = angle du point visé dans le repère du robot
+//   kappa = 2 sin(alpha) / L                       (courbure de l'arc)
+//   v = min(v_max, sqrt(a_lat_max / |kappa|), sqrt(2 a_dec d_but), k_approche d_but)
+//   omega = v * kappa
+
+struct PurePursuitConfig {
+  double lookahead_base = 0.06;   // L0 (m)
+  double lookahead_gain = 0.3;    // k_v (s)
+  double lookahead_min = 0.05;    // (m)
+  double lookahead_max = 0.15;    // (m)
+  double lateral_accel_max = 0.3; // a_lat_max (m/s^2)
+  double decel = 0.3;             // a_dec (m/s^2)
+  double approach_gain = 2.0;     // v <= approach_gain * d_but près du but (1/s)
+  double stop_distance = 0.01;    // distance où l'on coupe l'avance (m)
+  double search_window = 0.3;     // fenêtre de recherche du point le plus proche (m)
+};
+
+PurePursuitConfig loadPurePursuitConfig(const ConfigNode& section);
+
+class PurePursuit : public IController {
+ public:
+  PurePursuit(const PurePursuitConfig& config, const ControlLimits& limits,
+              const RotationConfig& rotation);
+
+  Twist2D compute(const Pose2D& est, const Twist2D& vel,
+                        const Path& path, Time t) override;
+  void reset() override;
+  ControlState state() const override { return state_; }
+  const ControlDebug& debug() const override { return debug_; }
+  const char* name() const override { return "PurePursuit"; }
+
+ private:
+  Twist2D track(const Pose2D& est, const Twist2D& vel, const Path& path,
+                      double distance_to_goal);
+  Twist2D applyLimits(Twist2D cmd, Time t);
+
+  PurePursuitConfig config_;
+  ControlLimits limits_;
+  RotationConfig rotation_;
+  ControlState state_ = ControlState::Rotating;
+  ControlDebug debug_;
+  std::size_t index_ = 0;
+  bool started_ = false;
+  bool final_phase_ = false;
+  Twist2D last_cmd_;
+  Time last_time_ = -1.0;
+};
+
+// MPPI (Model Predictive Path Integral) : commande prédictive par échantillonnage.
+//
+// À chaque cycle :
+//  1) on part d'une séquence nominale de N commandes (v, omega) (celle du cycle précédent,
+//     décalée d'un pas : "démarrage à chaud") ;
+//  2) on tire K séquences bruitées autour d'elle et on simule chacune avec le modèle du robot
+//     (unicycle + 1er ordre, le même que l'EKF) ;
+//  3) chaque trajectoire reçoit un coût S_k (écart au chemin, obstacles, à-coups, cap, vitesse,
+//     point visé à la fin de l'horizon) ;
+//  4) nouvelle séquence = moyenne des séquences pondérée par w_k = exp(-(S_k - S_min) / lambda) ;
+//  5) on applique la première commande.
+// Les derniers centimètres (approche fine du but, alignement final) sont confiés à Pure
+// Pursuit : l'échantillonnage converge mal à 1 cm près.
+
+struct MppiConfig {
+  double horizon = 1.5;     // s
+  double dt = 0.05;         // pas de l'horizon (s) -> 30 pas
+  int samples = 512;        // K
+  double sigma_v = 0.08;    // écart-type du bruit sur v (m/s)
+  double sigma_omega = 1.0; // écart-type du bruit sur omega (rad/s)
+  double lambda = 1.0;      // température : petite = on suit surtout le meilleur échantillon
+  double w_path = 300.0;    // distance au chemin au carré
+  double w_obstacle = 3.0;  // coût d'inflation (normalisé sur 253)
+  double w_dcmd = 0.5;      // variation de commande au carré (normalisée par les sigmas)
+  double w_heading = 1.0;   // erreur de cap par rapport au chemin au carré
+  double w_speed = 50.0;    // dépassement de la vitesse de référence au carré
+  double w_terminal = 100.0;  // distance au point visé en fin d'horizon au carré
+  double v_min = -0.05;     // petite marche arrière permise (m/s)
+  double handover_distance = 0.08;  // sous cette distance au but, Pure Pursuit termine (m)
+  double tau_v = 0.1, tau_omega = 0.1;  // modèle moteur (robot.yaml)
+  unsigned seed = 1;
+};
+
+MppiConfig loadMppiConfig(const ConfigNode& section, double tau, unsigned seed);
+
+class Mppi : public IController {
+ public:
+  Mppi(const MppiConfig& config, const PurePursuitConfig& speed_profile, const ControlLimits& limits,
+       const RotationConfig& rotation, const CostMap* costmap);
+
+  Twist2D compute(const Pose2D& est, const Twist2D& vel,
+                        const Path& path, Time t) override;
+  void reset() override;
+  ControlState state() const override { return state_; }
+  const ControlDebug& debug() const override { return debug_; }
+  const char* name() const override { return "MPPI"; }
+
+  // Quelques trajectoires échantillonnées et la trajectoire retenue (affichage).
+  const std::vector<std::vector<Eigen::Vector2d>>& sampledTrajectories() const { return sampled_; }
+  const std::vector<Eigen::Vector2d>& optimalTrajectory() const { return optimal_; }
+
+ private:
+  Twist2D optimize(const Pose2D& est, const Twist2D& vel, const Path& path, Time t);
+  double referenceSpeed(double distance_to_goal) const;
+  double obstacleCost(double x, double y) const;  // 0..253, 254 = létal
+  std::vector<Eigen::Vector2d> rollout(const Eigen::Matrix<double, 5, 1>& x0,
+                                       const std::vector<Twist2D>& u) const;
+
+  MppiConfig config_;
+  PurePursuitConfig speed_;
+  ControlLimits limits_;
+  RotationConfig rotation_;
+  const CostMap* costmap_;  // carte d'inflation du Navigator
+  std::mt19937 rng_;
+  std::vector<Twist2D> nominal_;
+  Twist2D last_cmd_;
+  ControlState state_ = ControlState::Rotating;
+  ControlDebug debug_;
+  std::size_t index_ = 0;
+  bool started_ = false;
+  bool handed_over_ = false;
+  PurePursuit finisher_;  // approche finale
+  std::vector<std::vector<Eigen::Vector2d>> sampled_;
+  std::vector<Eigen::Vector2d> optimal_;
+};
