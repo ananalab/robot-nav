@@ -1,0 +1,112 @@
+# Réglages des algorithmes, de la simulation et du matériel.
+
+sim:
+  seed: 42                    # graine de tout l'aléa de la sim (exécutions reproductibles)
+
+  physics:
+    dt: 0.001                 # pas d'intégration (s)
+    slip_sigma: 0.03          # glissement des roues : écart-type relatif
+    slip_period: 0.05         # un tirage de glissement est gardé pendant cette durée (s)
+    battery_sag: 0.0          # 0.1 = les moteurs perdent 10 % de gain en battery_duration
+    battery_duration: 3600.0  # (s)
+
+  # Vrais paramètres des moteurs simulés : proches de ceux mesurés sur le vrai robot, mais
+  # différents exprès de robot.yaml (gains ±5 %, zones mortes un peu plus faibles) : le contrôleur ne les
+  # connaît pas.
+  true_motors:
+    left:  {gain: 0.61, deadzone: 0.08}
+    right: {gain: 0.43, deadzone: 0.06}
+    tau: 0.12
+    delay: 0.10
+
+  world:
+    start: [0.2, 0.25, 0.0]  # x, y (m), cap (degrés)
+    obstacles:                # boîtes : centre (m), dimensions (m), lacet (degrés)
+      - {x: 0.40, y: 0.15, length: 0.10, width: 0.10, yaw: 0, color: red}
+      - {x: 0.80, y: 0.70, length: 0.10, width: 0.10, yaw: 0, color: red}
+      - {x: 1.15, y: 0.15, length: 0.10, width: 0.10, yaw: 30, color: red}
+
+  camera:                     # caméra virtuelle (iPhone en 0.5x, 1920 x 1440, comme la vraie)
+    width: 1920
+    height: 1440
+    fx: 820.0
+    fy: 820.0                 # centre optique au milieu de l'image
+    k1: -0.03                 # distorsion radiale légère
+    position: [0.67, 0.42, 1.24]  # centre optique (m) : au-dessus du centre de l'arène
+    tilt_deg: 2.0             # légère inclinaison
+    yaw_deg: 91.0             # grand côté de l'arène dans le sens de la hauteur de l'image
+    fps: 30.0
+    latency: 0.15             # retard d'un flux de téléphone (s)
+    p_drop: 0.03              # images perdues
+    p_occlusion: 0.02         # tag robot masqué
+    blur_sigma: 0.7           # flou (px)
+    noise_sigma: 4.0          # bruit (niveaux de gris)
+    exposure_sigma: 0.05      # variation d'exposition
+    chassis_length: 0.20      # boîte sombre du châssis (m)
+    chassis_width: 0.18
+    roof_size: 0.11           # carton blanc qui porte le tag (m)
+    obstacle_colors:          # couleur de rendu de chaque obstacle (BGR)
+      - {name: red, bgr: [40, 40, 200]}
+
+planning:
+  grid:
+    resolution: 0.01          # taille d'une cellule (m)
+
+  inflation:                  # le rayon du robot vient de robot.yaml
+    margin: 0.01              # marge de sécurité ajoutée au rayon du robot (m) ; obstacles = feuilles à plat
+    alpha: 20.0               # décroissance du coût : c = 253 exp(-alpha (d - r)) (1/m)
+    d_max: 0.25               # au-delà de cette distance à un obstacle, coût nul (m)
+
+  astar:
+    w_cost: 2.0               # poids du coût d'inflation (0 = plus court chemin pur)
+
+  smoothing:
+    w_data: 0.1               # attache au chemin A*
+    w_smooth: 0.3             # lissage
+    w_obstacle: 0.3           # éloignement des obstacles
+    obstacle_distance: 0.10   # portée de l'éloignement (m)
+    iterations: 100
+    resample_step: 0.01       # un point tous les 1 cm
+
+  replan:
+    max_deviation: 0.10       # écart au chemin qui force une replanification (m)
+
+control:
+  rate: 30.0                  # fréquence de la boucle de contrôle (Hz), celle de la caméra
+
+  limits:
+    v_max: 0.25               # vitesse d'avance max (m/s)
+    omega_max: 3.0            # vitesse de rotation max (rad/s)
+    accel_max: 0.6            # accélération max (m/s^2)
+    alpha_max: 8.0            # accélération angulaire max (rad/s^2)
+
+  rotation:
+    start_threshold_deg: 45   # écart de cap avec le chemin qui déclenche une rotation sur place
+    stop_threshold_deg: 10    # la rotation s'arrête sous cet écart
+    gain: 3.0                 # omega = gain * erreur de cap
+    omega_max: 1.5            # vitesse de rotation max sur place (rad/s)
+    lag: 0.15                 # retard + inertie des moteurs : on corrige le cap prédit à +lag (s)
+
+  goal:
+    position_tolerance: 0.02  # le but est atteint à 2 cm
+    heading_tolerance_deg: 5  # et 5° si un cap est demandé
+    hold_gain: 5.0            # maintien de position pendant la rotation finale (1/s)
+
+  pure_pursuit:
+    lookahead_base: 0.06      # L0 (m)
+    lookahead_gain: 0.3       # L = L0 + k_v |v| (s)
+    lookahead_min: 0.05       # (m)
+    lookahead_max: 0.15       # (m)
+    lateral_accel_max: 0.3    # limite la vitesse dans les virages (m/s^2)
+    decel: 0.3                # freinage avant le but (m/s^2)
+    approach_gain: 2.0        # v <= approach_gain * distance au but (1/s)
+    stop_distance: 0.01       # on coupe l'avance à 1 cm du but (le robot glisse encore un peu)
+    search_window: 0.3        # recherche du point le plus proche sur 30 cm devant (m)
+
+  mppi:
+    horizon: 1.5              # horizon de prédiction (s)
+    dt: 0.05                  # pas (s) -> 30 pas
+    samples: 512              # nombre de séquences tirées par cycle
+    sigma_v: 0.08             # bruit d'échantillonnage sur v (m/s)
+    sigma_omega: 1.0          # bruit d'échantillonnage sur omega (rad/s)
+    lambda: 1.0               # température
