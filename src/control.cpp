@@ -414,3 +414,107 @@ Twist2D Mppi::optimize(const Pose2D& est, const Twist2D& vel, const Path& path, 
     nominal_.erase(nominal_.begin());
     nominal_.push_back(nominal_.back());
   }
+
+  // Morceau de chemin utile : de l'indice courant jusqu'à ce que le robot peut atteindre.
+  const std::size_t first = index_;
+  std::size_t last = first;
+  const double s_reach = path.points[first].s + limits_.v_max * config_.horizon + 0.1;
+  while (last + 1 < path.points.size() && path.points[last].s < s_reach) ++last;
+  // Point visé en fin d'horizon : à v_ref * horizon devant, ou le but.
+  const double remaining = path.length() - path.points[first].s;
+  const double v_ref0 = referenceSpeed(std::max(remaining, 0.0));
+  std::size_t target = first;
+  while (target + 1 < path.points.size() &&
+         path.points[target].s < path.points[first].s + v_ref0 * config_.horizon) {
+    ++target;
+  }
+  const Eigen::Vector2d target_point(path.points[target].x, path.points[target].y);
+
+  Vector5d x0;
+  x0 << est.x, est.y, est.theta, vel.v, vel.omega;
+  // Robot déjà en zone létale (bruit de pose près d'un obstacle) : abandonner tous les
+  // échantillons bloquerait le robot. On pénalise alors chaque pas létal, ce qui favorise
+  // la trajectoire qui en sort le plus vite.
+  const bool start_lethal = obstacleCost(est.x, est.y) >= kLethal;
+  std::normal_distribution<double> noise_v(0.0, config_.sigma_v);
+  std::normal_distribution<double> noise_w(0.0, config_.sigma_omega);
+  std::vector<double> costs(samples, 0.0);
+  std::vector<std::vector<Twist2D>> eps(samples, std::vector<Twist2D>(steps));
+  sampled_.clear();
+
+  for (int k = 0; k < samples; ++k) {
+    Vector5d x = x0;
+    Twist2D previous = last_cmd_;
+    std::size_t nearest = first;
+    double cost = 0.0;
+    std::vector<Eigen::Vector2d> drawn;
+    for (int t = 0; t < steps; ++t) {
+      // Commande bruitée, bornée ; on garde le bruit réellement appliqué.
+      Twist2D u{nominal_[t].v + noise_v(rng_), nominal_[t].omega + noise_w(rng_)};
+      u.v = std::clamp(u.v, config_.v_min, limits_.v_max);
+      u.omega = std::clamp(u.omega, -limits_.omega_max, limits_.omega_max);
+      eps[k][t] = {u.v - nominal_[t].v, u.omega - nominal_[t].omega};
+      x = motionModel(x, u, config_.dt, config_.tau_v, config_.tau_omega);
+      if (k < kDrawnSamples) drawn.emplace_back(x(0), x(1));
+
+      const double obstacle = obstacleCost(x(0), x(1));
+      if (obstacle >= kLethal && !start_lethal) {
+        cost += kAbandoned;  // échantillon abandonné : il touche un obstacle
+        break;
+      }
+      if (obstacle >= kLethal) cost += kLethalStepPenalty;
+      // Point du chemin le plus proche (recherche vers l'avant dans le morceau utile).
+      double best = std::numeric_limits<double>::infinity();
+      for (std::size_t j = nearest; j <= last; ++j) {
+        const double d2 = std::pow(path.points[j].x - x(0), 2) + std::pow(path.points[j].y - x(1), 2);
+        if (d2 < best) {
+          best = d2;
+          nearest = j;
+        }
+      }
+      const double heading = wrapAngle(x(2) - path.points[nearest].theta);
+      const double to_goal = path.length() - path.points[nearest].s;
+      const double overspeed = std::max(0.0, std::abs(x(3)) - referenceSpeed(to_goal));
+      const double dv = (u.v - previous.v) / std::max(config_.sigma_v, 1e-3);
+      const double dw = (u.omega - previous.omega) / std::max(config_.sigma_omega, 1e-3);
+      cost += config_.w_path * best + config_.w_obstacle * obstacle / 253.0 +
+              config_.w_dcmd * (dv * dv + dw * dw) / steps + config_.w_heading * heading * heading +
+              config_.w_speed * overspeed * overspeed;
+      previous = u;
+    }
+    if (cost < kAbandoned) {
+      cost += config_.w_terminal * (Eigen::Vector2d(x(0), x(1)) - target_point).squaredNorm();
+    }
+    costs[k] = cost;
+    if (k < kDrawnSamples) sampled_.push_back(drawn);
+  }
+
+  // Moyenne pondérée : w_k = exp(-(S_k - S_min) / lambda).
+  const double min_cost = *std::min_element(costs.begin(), costs.end());
+  if (min_cost >= kAbandoned) {
+    // Tous les échantillons touchent un obstacle : Pure Pursuit suit le chemin planifié
+    // (qui, lui, évite les obstacles) pendant ce cycle.
+    nominal_.clear();
+    return finisher_.compute(est, vel, path, t);
+  }
+
+  state_ = ControlState::Tracking;
+  std::vector<double> weights(samples);
+  double total = 0.0;
+  for (int k = 0; k < samples; ++k) {
+    weights[k] = std::exp(-(costs[k] - min_cost) / config_.lambda);
+    total += weights[k];
+  }
+  for (int t = 0; t < steps; ++t) {
+    double dv = 0.0, dw = 0.0;
+    for (int k = 0; k < samples; ++k) {
+      dv += weights[k] * eps[k][t].v;
+      dw += weights[k] * eps[k][t].omega;
+    }
+    nominal_[t].v = std::clamp(nominal_[t].v + dv / total, config_.v_min, limits_.v_max);
+    nominal_[t].omega = std::clamp(nominal_[t].omega + dw / total, -limits_.omega_max, limits_.omega_max);
+  }
+  optimal_ = rollout(x0, nominal_);
+  debug_.lookahead = target_point;
+  return nominal_.front();
+}
