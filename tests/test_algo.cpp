@@ -442,3 +442,280 @@ TEST(PurePursuit, CurvatureFormulaOnStraightPath) {
 
 TEST(PurePursuit, RotatesFirstWhenFacingAway) {
   auto pp = makePurePursuit();
+  const Twist2D cmd = pp.compute({0.0, 0.0, kPi / 2}, {}, straightPath(1.0), 0.0);
+  EXPECT_EQ(pp.state(), ControlState::Rotating);
+  EXPECT_DOUBLE_EQ(cmd.v, 0.0);
+}
+
+TEST(PurePursuit, ArrivesAndAlignsHeading) {
+  auto pp = makePurePursuit();
+  Path path = straightPath(0.5);
+  path.goal_heading = kPi / 2;
+  // Sur le but mais cap à 0 : rotation sur place vers +90°.
+  Twist2D cmd = pp.compute({0.5, 0.0, 0.0}, {}, path, 0.0);
+  EXPECT_EQ(pp.state(), ControlState::Rotating);
+  EXPECT_GT(cmd.omega, 0.0);
+  cmd = pp.compute({0.5, 0.0, kPi / 2}, {}, path, 0.1);
+  EXPECT_EQ(pp.state(), ControlState::Arrived);
+  EXPECT_DOUBLE_EQ(cmd.omega, 0.0);
+}
+
+// ------------------------------------------------------------ MPPI
+
+namespace {
+// Carte sans obstacle (coût nul partout) de -1 à 2 m en x, -1 à 1 m en y.
+const CostMap& emptyCostMap() {
+  static const CostMap map(OccupancyGrid(-1.0, -1.0, 300, 200, 0.01), InflationConfig{});
+  return map;
+}
+// Mur létal au-dessus de y = 0,03 m (aucune inflation).
+const CostMap& wallCostMap() {
+  static CostMap map;
+  if (map.grid().cols() == 0) {
+    OccupancyGrid grid(-1.0, -1.0, 300, 200, 0.01);
+    grid.fillPolygon({{-1.0, 0.03}, {2.0, 0.03}, {2.0, 1.0}, {-1.0, 1.0}});
+    InflationConfig none;
+    none.robot_radius = 0.0;
+    none.margin = 0.0;
+    none.d_max = 0.01;
+    map = CostMap(grid, none);
+  }
+  return map;
+}
+Mppi makeMppi(unsigned seed) {
+  MppiConfig cfg;
+  cfg.seed = seed;
+  return Mppi(cfg, PurePursuitConfig{}, ControlLimits{}, RotationConfig{}, &emptyCostMap());
+}
+}  // namespace
+
+TEST(Mppi, DrivesForwardAlongStraightPath) {
+  auto mppi = makeMppi(1);
+  const Path path = straightPath(1.0);
+  Twist2D cmd;
+  for (int i = 0; i < 20; ++i) cmd = mppi.compute({0.0, 0.0, 0.0}, cmd, path, i * 0.033);
+  EXPECT_EQ(mppi.state(), ControlState::Tracking);
+  EXPECT_GT(cmd.v, 0.05);
+  EXPECT_LT(std::abs(cmd.omega), 0.5);
+}
+
+TEST(Mppi, DeterministicWithFixedSeed) {
+  auto a = makeMppi(3), b = makeMppi(3);
+  const Path path = straightPath(1.0);
+  const Pose2D pose{0.0, 0.02, 0.1};
+  for (int i = 0; i < 5; ++i) {
+    const Twist2D ca = a.compute(pose, {0.1, 0.0}, path, i * 0.033);
+    const Twist2D cb = b.compute(pose, {0.1, 0.0}, path, i * 0.033);
+    EXPECT_DOUBLE_EQ(ca.v, cb.v);
+    EXPECT_DOUBLE_EQ(ca.omega, cb.omega);
+  }
+}
+
+TEST(Mppi, AvoidsLethalSamples) {
+  // Mur létal à y > 0.03 : la trajectoire retenue ne doit jamais y entrer.
+  MppiConfig cfg;
+  Mppi mppi(cfg, PurePursuitConfig{}, ControlLimits{}, RotationConfig{}, &wallCostMap());
+  Twist2D cmd;
+  for (int i = 0; i < 10; ++i) cmd = mppi.compute({0.0, 0.0, 0.0}, cmd, straightPath(1.0), i * 0.033);
+  for (const auto& p : mppi.optimalTrajectory()) EXPECT_LE(p.y(), 0.03);
+}
+
+#ifdef NDEBUG
+TEST(Mppi, P99ComputeTimeUnder20ms) {
+  auto mppi = makeMppi(5);
+  const Path path = straightPath(1.0);
+  std::vector<double> ms;
+  Twist2D cmd;
+  for (int i = 0; i < 100; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    cmd = mppi.compute({0.0, 0.01, 0.05}, cmd, path, i * 0.033);
+    ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  }
+  std::sort(ms.begin(), ms.end());
+  std::cout << "MPPI : p50 " << ms[50] << " ms, p99 " << ms[98] << " ms\n";
+  EXPECT_LT(ms[98], 20.0);
+}
+#endif
+
+#ifdef RN_WITH_OPENCV
+#endif
+
+namespace {
+InflationConfig smallRobot() {
+  InflationConfig cfg;
+  cfg.robot_radius = 0.04;
+  cfg.margin = 0.01;
+  cfg.alpha = 20.0;
+  cfg.d_max = 0.2;
+  return cfg;
+}
+
+// Cellule libre (non létale) tirée au hasard.
+GridIndex randomFreeCell(const CostMap& map, std::mt19937& rng) {
+  std::uniform_int_distribution<int> uc(0, map.grid().cols() - 1), ur(0, map.grid().rows() - 1);
+  for (int tries = 0; tries < 10000; ++tries) {
+    const GridIndex c{uc(rng), ur(rng)};
+    if (!map.lethal(c)) return c;
+  }
+  return {-1, -1};
+}
+}  // namespace
+
+// ------------------------------------------------------------ grille
+TEST(OccupancyGrid, WorldCellRoundTrip) {
+  const OccupancyGrid grid(-0.5, 0.2, 100, 50, 0.01);
+  const GridIndex c = grid.worldToCell(0.123, 0.456);
+  EXPECT_EQ(c.col, 62);
+  EXPECT_EQ(c.row, 25);
+  const Eigen::Vector2d center = grid.cellToWorld(c);
+  EXPECT_NEAR(center.x(), 0.125, 1e-12);
+  EXPECT_NEAR(center.y(), 0.455, 1e-12);
+  EXPECT_FALSE(grid.inside(grid.worldToCell(-0.51, 0.3)));
+}
+
+TEST(OccupancyGrid, FillRotatedRectangle) {
+  OccupancyGrid grid(0.0, 0.0, 100, 100, 0.01);
+  grid.fillPolygon(rectangleCorners(0.5, 0.5, 0.2, 0.1, kPi / 2));
+  EXPECT_EQ(grid.at(grid.worldToCell(0.5, 0.58)), CellState::Occupied);  // le long de y
+  EXPECT_EQ(grid.at(grid.worldToCell(0.58, 0.5)), CellState::Free);      // trop loin en x
+}
+
+TEST(OccupancyGrid, ArenaBorderIsOccupied) {
+  ArenaConfig arena;  // 1.0 x 0.7 par défaut
+  const OccupancyGrid grid = makeArenaGrid(arena, 0.01);
+  EXPECT_EQ(grid.at(grid.worldToCell(0.5, 0.35)), CellState::Free);
+  EXPECT_EQ(grid.at(grid.worldToCell(-0.015, 0.35)), CellState::Occupied);
+  EXPECT_EQ(grid.at(grid.worldToCell(0.5, 0.715)), CellState::Occupied);
+}
+
+// ------------------------------------------------------------ distance + inflation
+TEST(DistanceTransform, OneDimensionalKnownValues) {
+  const double far = 1e12;
+  std::vector<double> d;
+  squaredDistance1D({far, 0.0, far, far, far, 0.0}, d);
+  const std::vector<double> expected{1, 0, 1, 4, 1, 0};
+  for (std::size_t i = 0; i < d.size(); ++i) EXPECT_DOUBLE_EQ(d[i], expected[i]) << i;
+}
+
+TEST(DistanceTransform, MatchesBruteForce) {
+  std::mt19937 rng(3);
+  const OccupancyGrid grid = randomBoxMap(60, 40, 0.01, 4, rng);
+  const std::vector<double> edt = euclideanDistanceTransform(grid);
+  for (int i = 0; i < grid.cols() * grid.rows(); ++i) {
+    const GridIndex c = grid.fromLinear(i);
+    double best = 1e9;
+    for (int j = 0; j < grid.cols() * grid.rows(); ++j) {
+      const GridIndex o = grid.fromLinear(j);
+      if (grid.at(o) != CellState::Free) {
+        best = std::min(best, std::hypot(c.col - o.col, c.row - o.row));
+      }
+    }
+    ASSERT_NEAR(edt[i], best, 1e-9) << "cellule " << c.col << "," << c.row;
+  }
+}
+
+#ifdef RN_WITH_OPENCV
+TEST(DistanceTransform, MatchesOpenCv) {
+  std::mt19937 rng(5);
+  const OccupancyGrid grid = randomBoxMap(200, 120, 0.01, 10, rng);
+  const std::vector<double> edt = euclideanDistanceTransform(grid);
+  // OpenCV calcule la distance au pixel nul le plus proche : obstacles = 0.
+  cv::Mat free_mask(grid.rows(), grid.cols(), CV_8UC1);
+  for (int r = 0; r < grid.rows(); ++r)
+    for (int c = 0; c < grid.cols(); ++c)
+      free_mask.at<uchar>(r, c) = grid.at({c, r}) == CellState::Free ? 255 : 0;
+  cv::Mat dist;
+  cv::distanceTransform(free_mask, dist, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+  for (int r = 0; r < grid.rows(); ++r)
+    for (int c = 0; c < grid.cols(); ++c)
+      ASSERT_NEAR(edt[grid.linear({c, r})], dist.at<float>(r, c), 1e-3);
+}
+#endif
+
+TEST(CostMap, LethalInsideRadiusZeroBeyondDmax) {
+  OccupancyGrid grid(0.0, 0.0, 100, 10, 0.01);
+  grid.set({0, 5}, CellState::Occupied);
+  for (int r = 0; r < 10; ++r) grid.set({0, r}, CellState::Occupied);  // mur à gauche
+  const CostMap map(grid, smallRobot());  // létal jusqu'à 5 cm, nul après 20 cm
+  EXPECT_TRUE(map.lethal({5, 5}));        // 5 cellules = 5 cm
+  EXPECT_FALSE(map.lethal({6, 5}));
+  EXPECT_GT(map.cost({6, 5}), 200);
+  EXPECT_GT(map.cost({6, 5}), map.cost({10, 5}));  // décroissant
+  EXPECT_EQ(map.cost({20, 5}), 0);
+  EXPECT_TRUE(map.lethal({-1, 5}));  // hors grille
+}
+
+// ------------------------------------------------------------ A*
+TEST(AStar, SameCostAsDijkstraOn200RandomMaps) {
+  std::mt19937 rng(42);
+  int with_path = 0;
+  for (int trial = 0; trial < 200; ++trial) {
+    const OccupancyGrid grid = randomBoxMap(80, 50, 0.01, 6, rng);
+    const CostMap map(grid, smallRobot());
+    const GridIndex start = randomFreeCell(map, rng);
+    const GridIndex goal = randomFreeCell(map, rng);
+    if (start.col < 0 || goal.col < 0) continue;
+    const auto astar = searchGrid(map, start, goal, 2.0, true);
+    const auto dijkstra = searchGrid(map, start, goal, 2.0, false);
+    ASSERT_EQ(astar.found, dijkstra.found) << "essai " << trial;
+    if (astar.found) {
+      ++with_path;
+      ASSERT_NEAR(astar.cost, dijkstra.cost, 1e-9) << "essai " << trial;
+      EXPECT_LE(astar.expanded, dijkstra.expanded);
+    }
+  }
+  EXPECT_GT(with_path, 100);  // le test n'a de sens que si la plupart des cartes ont un chemin
+}
+
+TEST(AStar, NoCornerCutting) {
+  OccupancyGrid grid(0.0, 0.0, 3, 3, 1.0);
+  InflationConfig none;
+  none.robot_radius = 0.0;
+  none.margin = 0.0;
+  none.d_max = 0.5;
+  // Deux obstacles en diagonale : on ne doit pas passer entre eux.
+  grid.set({1, 0}, CellState::Occupied);
+  grid.set({0, 1}, CellState::Occupied);
+  const CostMap map(grid, none);
+  EXPECT_FALSE(searchGrid(map, {0, 0}, {1, 1}, 0.0).found);
+}
+
+TEST(AStar, NoPathThroughWall) {
+  OccupancyGrid grid(0.0, 0.0, 100, 60, 0.01);
+  for (int r = 0; r < 60; ++r) grid.set({50, r}, CellState::Occupied);
+  const CostMap map(grid, smallRobot());
+  PlannerConfig cfg;
+  const PlanResult res = planPath(map, {0.1, 0.3, 0.0}, {0.9, 0.3}, std::nullopt, cfg);
+  EXPECT_EQ(res.status, PlanStatus::NoPath);
+}
+
+TEST(Planner, StartInLethalZoneEscapes) {
+  OccupancyGrid grid(0.0, 0.0, 100, 60, 0.01);
+  grid.fillPolygon(rectangleCorners(0.3, 0.3, 0.1, 0.1, 0.0));
+  const CostMap map(grid, smallRobot());
+  PlannerConfig cfg;
+  // Départ à 2 cm du bord de la boîte, donc en zone létale (rayon 5 cm).
+  const PlanResult res = planPath(map, {0.37, 0.3, 0.0}, {0.9, 0.5}, std::nullopt, cfg);
+  ASSERT_EQ(res.status, PlanStatus::Ok);
+  EXPECT_TRUE(res.start_escaped);
+  EXPECT_FALSE(map.lethal(res.raw_cells.front()));
+}
+
+TEST(Planner, GoalInObstacleIsRejected) {
+  OccupancyGrid grid(0.0, 0.0, 100, 60, 0.01);
+  grid.fillPolygon(rectangleCorners(0.5, 0.3, 0.1, 0.1, 0.0));
+  const CostMap map(grid, smallRobot());
+  PlannerConfig cfg;
+  EXPECT_EQ(planPath(map, {0.1, 0.1, 0}, {0.5, 0.3}, std::nullopt, cfg).status,
+            PlanStatus::GoalInObstacle);
+  EXPECT_EQ(planPath(map, {0.1, 0.1, 0}, {5.0, 0.3}, std::nullopt, cfg).status,
+            PlanStatus::GoalOutsideMap);
+}
+
+// ------------------------------------------------------------ lissage
+TEST(Smoother, ResampleSpacing) {
+  const auto pts = resamplePolyline({{0, 0}, {0.1, 0}, {0.1, 0.055}}, 0.01);
+  for (std::size_t i = 1; i < pts.size(); ++i) {
+    EXPECT_LE((pts[i] - pts[i - 1]).norm(), 0.01 + 1e-9);
+  }
+  EXPECT_NEAR((pts.back() - Eigen::Vector2d(0.1, 0.055)).norm(), 0.0, 1e-12);
