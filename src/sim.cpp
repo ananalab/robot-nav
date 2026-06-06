@@ -136,3 +136,142 @@ void SimWorld::step(double dt) {
   // 1) Les commandes dont le retard est écoulé deviennent actives.
   while (!pending_.empty() && pending_.front().effective_time <= time_ + 1e-12) {
     active_cmd_ = pending_.front().cmd;
+    pending_.pop_front();
+  }
+
+  // 2) Dynamique du 1er ordre de chaque roue : tau * dv/dt = v_ss - v
+  const double tau = config_.robot.tau;
+  v_left_ += dt / tau * (wheelTarget(config_.robot.left, active_cmd_.left) - v_left_);
+  v_right_ += dt / tau * (wheelTarget(config_.robot.right, active_cmd_.right) - v_right_);
+
+  // 3) Glissement multiplicatif v_eff = v * (1 + eps), tiré toutes les slip_period.
+  if (config_.slip_sigma > 0.0 && time_ >= next_slip_draw_) {
+    slip_left_ = slip_noise_(rng_);
+    slip_right_ = slip_noise_(rng_);
+    next_slip_draw_ = time_ + config_.slip_period;
+  }
+  const double vl = v_left_ * (1.0 + slip_left_);
+  const double vr = v_right_ * (1.0 + slip_right_);
+
+  // 4) Cinématique unicycle : v = (vL + vR) / 2,  omega = (vR - vL) / b.
+  //    Intégration au point milieu de l'angle (plus précise qu'Euler simple).
+  const double v = (vl + vr) / 2.0;
+  const double omega = (vr - vl) / config_.robot.wheel_base;
+  const double mid_theta = pose_.theta + omega * dt / 2.0;
+  Pose2D next = pose_;
+  next.x += v * std::cos(mid_theta) * dt;
+  next.y += v * std::sin(mid_theta) * dt;
+  next.theta = wrapAngle(pose_.theta + omega * dt);
+
+  // 5) Collision : un contact = un événement. Contre un mur ou une boîte, le robot reste
+  //    bloqué là où il est ; sur une feuille posée à plat, il roule dessus.
+  const bool moving = std::abs(v) > 1e-9 || std::abs(omega) > 1e-9;
+  const int contact = moving ? poseContact(next) : 0;
+  if (contact > 0) {
+    if (!in_contact_) {
+      ++collision_count_;
+    }
+    in_contact_ = true;
+    if (contact == 1) pose_ = next;
+  } else {
+    pose_ = next;
+    in_contact_ = moving ? false : in_contact_;
+  }
+
+  if (active_cmd_.left != 0.0 || active_cmd_.right != 0.0) {
+    motor_on_time_ += dt;
+  }
+  time_ += dt;
+}
+
+std::vector<Scenario> loadScenarios(const std::string& path, double obstacle_height) {
+  const ConfigNode root = ConfigNode::loadFile(path);
+  std::vector<Scenario> scenarios;
+  for (const ConfigNode& node : root.list("scenarios")) {
+    Scenario sc;
+    sc.name = node.getString("name");
+    const auto start = node.getDoubleList("start", 3);
+    sc.start = {start[0], start[1], degToRad(start[2])};
+    const auto goal = node.getDoubleList("goal");
+    if (goal.size() != 2 && goal.size() != 3) {
+      throw ConfigError(path + ": " + sc.name + ".goal : [x, y] ou [x, y, cap_deg] attendu");
+    }
+    sc.goal = {goal[0], goal[1]};
+    if (goal.size() == 3) {
+      sc.goal_heading = degToRad(goal[2]);
+    }
+    sc.obstacles = loadBoxes(node, obstacle_height);
+    scenarios.push_back(sc);
+  }
+  return scenarios;
+}
+
+#include "fw_protocol.h"  // firmware/robot_fw : le code de la vraie carte
+
+SimFirmware::SimFirmware(SimWorld& world, const IClock& clock, double watchdog, bool ack)
+    : world_(world), clock_(clock), watchdog_(watchdog), ack_(ack) {
+  world_.setCommand({0.0, 0.0});
+  reply("B");  // comme la carte au démarrage
+}
+
+void SimFirmware::reply(const char* body) {
+  char out[FW_LINE_MAX];
+  fwFrame(body, out);
+  outbox_.emplace_back(out);
+}
+
+bool SimFirmware::writeLine(std::string_view line) {
+  checkWatchdog();
+  // Même contrainte que la carte : buffer de 32 octets.
+  if (line.size() >= FW_LINE_MAX) {
+    ++invalid_;
+    return true;
+  }
+  const std::string text(line);
+  FwCommand cmd;
+  if (!fwParseLine(text.c_str(), cmd)) {
+    ++invalid_;
+    return true;  // la carte ignore les trames invalides
+  }
+  ++valid_;
+  last_valid_ = clock_.now();
+  watchdog_fired_ = false;
+  char body[12];
+  switch (cmd.type) {
+    case FW_MOTOR:
+      world_.setCommand({cmd.left / 255.0, cmd.right / 255.0});
+      if (ack_) {
+        std::snprintf(body, sizeof(body), "A,%d", cmd.seq);
+        reply(body);
+      }
+      break;
+    case FW_STOP:
+      world_.setCommand({0.0, 0.0});
+      break;
+    case FW_PING:
+      if (ack_) {
+        std::snprintf(body, sizeof(body), "A,%d", cmd.seq);
+        reply(body);
+      }
+      break;
+    default:
+      break;
+  }
+  return true;
+}
+
+void SimFirmware::checkWatchdog() {
+  if (!watchdog_fired_ && clock_.now() - last_valid_ > watchdog_) {
+    world_.setCommand({0.0, 0.0});
+    reply("W");
+    watchdog_fired_ = true;
+  }
+}
+
+std::optional<std::string> SimFirmware::readLine() {
+  checkWatchdog();
+  if (outbox_.empty()) return std::nullopt;
+  std::string line = outbox_.front();
+  outbox_.pop_front();
+  return line;
+}
