@@ -1,0 +1,100 @@
+# 20 scénarios dans l'arène 1,33 x 0,85 m (robot de rayon 12 cm), tirés au hasard puis figés
+# (0, 1 ou 2 boîtes entre le départ et le but ; seuls les tirages sans chemin possible ont été écartés).
+scenarios:
+  - name: b01
+    start: [0.19, 0.52, 90]
+    goal: [0.94, 0.47]
+  - name: b02
+    start: [0.48, 0.22, 180]
+    goal: [1.03, 0.67, -90]
+  - name: b03
+    start: [0.17, 0.67, -135]
+    goal: [0.69, 0.23]
+  - name: b04
+    start: [0.27, 0.36, 135]
+    goal: [0.88, 0.26, 0]
+  - name: b05
+    start: [0.42, 0.46, -45]
+    goal: [1.12, 0.61]
+  - name: b06
+    start: [0.32, 0.20, 180]
+    goal: [1.02, 0.63, 90]
+    obstacles:
+      - {x: 0.67, y: 0.39, length: 0.1, width: 0.11, yaw: 15}
+  - name: b07
+    start: [0.19, 0.50, -135]
+    goal: [1.14, 0.36]
+    obstacles:
+      - {x: 0.58, y: 0.35, length: 0.11, width: 0.09, yaw: 30}
+  - name: b08
+    start: [0.62, 0.19, 0]
+    goal: [1.11, 0.64, 0]
+    obstacles:
+      - {x: 0.81, y: 0.4, length: 0.11, width: 0.13, yaw: 30}
+  - name: b09
+    start: [1.05, 0.37, 90]
+    goal: [0.31, 0.67]
+    obstacles:
+      - {x: 0.63, y: 0.57, length: 0.1, width: 0.1, yaw: 0}
+  - name: b10
+    start: [0.93, 0.62, 90]
+    goal: [0.44, 0.18, 0]
+    obstacles:
+      - {x: 0.68, y: 0.32, length: 0.14, width: 0.11, yaw: 30}
+  - name: b11
+    start: [0.96, 0.39, 180]
+    goal: [0.18, 0.57]
+    obstacles:
+      - {x: 0.65, y: 0.48, length: 0.09, width: 0.08, yaw: 45}
+  - name: b12
+    start: [1.09, 0.45, 180]
+    goal: [0.33, 0.38, 90]
+    obstacles:
+      - {x: 0.72, y: 0.46, length: 0.12, width: 0.1, yaw: 15}
+  - name: b13
+    start: [0.98, 0.26, 45]
+    goal: [0.17, 0.63]
+    obstacles:
+      - {x: 0.65, y: 0.39, length: 0.1, width: 0.13, yaw: 45}
+  - name: b14
+    start: [0.96, 0.62, -90]
+    goal: [0.25, 0.64, -90]
+    obstacles:
+      - {x: 0.65, y: 0.62, length: 0.1, width: 0.13, yaw: 0}
+      - {x: 0.67, y: 0.67, length: 0.13, width: 0.14, yaw: 45}
+  - name: b15
+    start: [1.15, 0.29, 45]
+    goal: [0.26, 0.23]
+    obstacles:
+      - {x: 0.73, y: 0.33, length: 0.12, width: 0.12, yaw: 45}
+      - {x: 0.86, y: 0.19, length: 0.09, width: 0.11, yaw: 0}
+  - name: b16
+    start: [0.94, 0.20, -135]
+    goal: [0.46, 0.67, 0]
+    obstacles:
+      - {x: 0.7, y: 0.44, length: 0.08, width: 0.11, yaw: 45}
+      - {x: 0.7, y: 0.46, length: 0.09, width: 0.11, yaw: 60}
+  - name: b17
+    start: [1.10, 0.18, 180]
+    goal: [0.17, 0.48]
+    obstacles:
+      - {x: 0.69, y: 0.27, length: 0.11, width: 0.12, yaw: 30}
+      - {x: 0.65, y: 0.42, length: 0.1, width: 0.09, yaw: 60}
+  - name: b18
+    start: [0.36, 0.35, 135]
+    goal: [1.00, 0.60, -90]
+    obstacles:
+      - {x: 0.59, y: 0.46, length: 0.1, width: 0.14, yaw: 15}
+      - {x: 0.68, y: 0.46, length: 0.12, width: 0.09, yaw: 45}
+  - name: b19
+    start: [0.19, 0.18, -90]
+    goal: [1.10, 0.29]
+    obstacles:
+      - {x: 0.77, y: 0.22, length: 0.1, width: 0.14, yaw: 60}
+      - {x: 0.56, y: 0.25, length: 0.14, width: 0.1, yaw: 60}
+  - name: b20
+    start: [1.15, 0.25, 0]
+    goal: [0.29, 0.40, 0]
+    obstacles:
+      - {x: 0.58, y: 0.35, length: 0.13, width: 0.13, yaw: 30}
+      - {x: 0.78, y: 0.29, length: 0.12, width: 0.09, yaw: 15}
