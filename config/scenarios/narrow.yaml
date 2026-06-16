@@ -1,0 +1,50 @@
+# Passages étroits et slaloms (arène 1,33 x 0,85 m).
+scenarios:
+  - name: n01
+    start: [0.2, 0.425, 0]
+    goal: [1.13, 0.425]
+    obstacles:
+      - {x: 0.665, y: 0.345, length: 0.14, width: 0.16, yaw: 0}
+  - name: n02
+    start: [0.2, 0.425, 0]
+    goal: [1.13, 0.425]
+    obstacles:
+      - {x: 0.665, y: 0.375, length: 0.14, width: 0.16, yaw: 0}
+  - name: n03
+    start: [0.2, 0.425, 0]
+    goal: [1.13, 0.425]
+    obstacles:
+      - {x: 0.665, y: 0.505, length: 0.14, width: 0.16, yaw: 0}
+  - name: n04
+    start: [0.2, 0.425, 0]
+    goal: [1.13, 0.425]
+    obstacles:
+      - {x: 0.665, y: 0.475, length: 0.14, width: 0.16, yaw: 0}
+  - name: n05
+    start: [0.2, 0.425, 0]
+    goal: [1.13, 0.425]
+    obstacles:
+      - {x: 0.665, y: 0.355, length: 0.14, width: 0.16, yaw: 0}
+  - name: n06
+    start: [0.2, 0.425, 0]
+    goal: [1.13, 0.425]
+    obstacles:
+      - {x: 0.665, y: 0.495, length: 0.14, width: 0.16, yaw: 0}
+  - name: n07
+    start: [0.2, 0.425, 0]
+    goal: [1.13, 0.425, 0]
+    obstacles:
+      - {x: 0.42, y: 0.575, length: 0.12, width: 0.12, yaw: 0}
+      - {x: 0.91, y: 0.275, length: 0.12, width: 0.12, yaw: 0}
+  - name: n08
+    start: [0.2, 0.425, 0]
+    goal: [1.13, 0.425, 0]
+    obstacles:
+      - {x: 0.42, y: 0.275, length: 0.12, width: 0.12, yaw: 0}
+      - {x: 0.91, y: 0.575, length: 0.12, width: 0.12, yaw: 0}
+  - name: n09
+    start: [0.2, 0.425, 0]
+    goal: [1.13, 0.425, 0]
+    obstacles:
+      - {x: 0.42, y: 0.585, length: 0.12, width: 0.12, yaw: 0}
+      - {x: 0.91, y: 0.265, length: 0.12, width: 0.12, yaw: 0}
