@@ -375,3 +375,380 @@ void Rig::tick(double dt) {
   }
   robot_->poll();
 }
+
+CameraModel Rig::cameraModel(bool force) {
+  cv::Vec3d rvec, tvec;
+  if (!options_.sim && !force && loadExtrinsics(extrinsics_path_, rvec, tvec)) {
+    return CameraModel(intrinsics_, rvec, tvec);
+  }
+  std::cout << "Calibration de l'arène (30 images des tags sol)...\n";
+  ArenaCalibrator calibrator(intrinsics_, setup_.arena);
+  for (int i = 0; i < 600 && calibrator.framesUsed() < 30; ++i) {
+    tick(1.0 / 30.0);
+    if (const auto f = camera_->grab()) calibrator.addFrame(f->image);
+  }
+  const ArenaCalibration calib = calibrator.solve();
+  if (!calib.ok) throw std::runtime_error("calibration de l'arène impossible : tags sol non vus");
+  std::cout << "Erreur de reprojection : " << calib.reprojection_error << " px, " << calib.tags_seen
+            << " tags sol vus\n";
+  if (!options_.sim) saveExtrinsics(extrinsics_path_, calib.rvec, calib.tvec, calib.reprojection_error);
+  return CameraModel(intrinsics_, calib.rvec, calib.tvec);
+}
+
+namespace {
+
+constexpr double kDt = 1.0 / 30.0;  // un cycle = une image
+
+struct Sample {
+  Time t;
+  Pose2D pose;
+};
+
+// Pente d'une droite y = a t + b par moindres carrés.
+double slope(const std::vector<double>& t, const std::vector<double>& y) {
+  const double n = static_cast<double>(t.size());
+  double st = 0, sy = 0, stt = 0, sty = 0;
+  for (std::size_t i = 0; i < t.size(); ++i) {
+    st += t[i];
+    sy += y[i];
+    stt += t[i] * t[i];
+    sty += t[i] * y[i];
+  }
+  const double den = n * stt - st * st;
+  return std::abs(den) < 1e-12 ? 0.0 : (n * sty - st * sy) / den;
+}
+
+class Procedure {
+ public:
+  Procedure(Rig& rig, const CameraModel& camera, const MotorCalibrationOptions& opt)
+      : rig_(rig), opt_(opt),
+        estimator_(rig.setup().config_dir, rig.setup().robot, rig.setup().arena,
+                   rig.setup().nav.planner.resolution) {
+    estimator_.setCameraModel(camera);
+  }
+
+  MotorCalibrationResult run();
+
+ private:
+  void log(const std::string& msg) const {
+    if (opt_.verbose) std::cout << msg << std::endl;
+  }
+  bool tickAndMeasure(std::vector<Sample>& out);
+  bool unsafe(const Pose2D& p) const;
+  bool drive(const WheelCmd& cmd, double duration, double settle, std::vector<Sample>& out,
+             Time& t_cmd);
+  bool steadyState(const std::vector<Sample>& s, Time from, Time to, double& v,
+                   double& omega) const;
+  bool rampDeadzone(bool left_wheel, double& u0);
+  bool rotateTo(double heading);
+  double availableDistance(const Pose2D& p, double direction) const;
+  void fitDynamics();
+
+  Rig& rig_;
+  MotorCalibrationOptions opt_;
+  StateEstimator estimator_;
+  Time last_seen_ = -1e9;
+  Pose2D last_pose_;
+  MotorCalibrationResult result_;
+  struct Step {
+    Time t_cmd;
+    double v_ss;
+    double direction;  // +1 avant, -1 arrière
+    std::vector<Sample> samples;
+  };
+  std::vector<Step> steps_;
+};
+
+bool Procedure::tickAndMeasure(std::vector<Sample>& out) {
+  rig_.tick(kDt);
+  const Time now = rig_.clock().now();
+  if (const auto frame = rig_.camera().grab()) {
+    const auto& loc = estimator_.processFrame(*frame, now);
+    if (loc.ok) {
+      out.push_back({loc.measurement.stamp, loc.measurement.pose});
+      last_seen_ = now;
+      last_pose_ = loc.measurement.pose;
+    }
+  }
+  return now - last_seen_ < 0.5;  // tag vu récemment ?
+}
+
+bool Procedure::unsafe(const Pose2D& p) const {
+  const auto& a = rig_.setup().arena;
+  const double m = opt_.edge_margin;
+  return p.x < a.x_min + m || p.x > a.x_max - m || p.y < a.y_min + m || p.y > a.y_max - m;
+}
+
+double Procedure::availableDistance(const Pose2D& p, double direction) const {
+  // Distance le long du cap (ou à l'opposé) avant d'entrer dans la marge du bord.
+  const auto& a = rig_.setup().arena;
+  const double dx = direction * std::cos(p.theta), dy = direction * std::sin(p.theta);
+  double d = 10.0;
+  if (dx > 1e-6) d = std::min(d, (a.x_max - opt_.edge_margin - p.x) / dx);
+  if (dx < -1e-6) d = std::min(d, (a.x_min + opt_.edge_margin - p.x) / dx);
+  if (dy > 1e-6) d = std::min(d, (a.y_max - opt_.edge_margin - p.y) / dy);
+  if (dy < -1e-6) d = std::min(d, (a.y_min + opt_.edge_margin - p.y) / dy);
+  return std::max(0.0, d);
+}
+
+bool Procedure::drive(const WheelCmd& cmd, double duration, double settle,
+                      std::vector<Sample>& out, Time& t_cmd) {
+  ProtocolRobot& robot = rig_.robot();
+  t_cmd = rig_.clock().now();
+  robot.send(cmd);
+  bool safe = true;
+  while (rig_.clock().now() < t_cmd + duration) {
+    robot.send(cmd);
+    if (!tickAndMeasure(out)) {
+      log("  Arrêt : tag robot perdu.");
+      safe = false;
+      break;
+    }
+    if (unsafe(last_pose_)) {
+      log("  Arrêt : trop près du bord de l'arène.");
+      safe = false;
+      break;
+    }
+    if (cmd.left != 0.0 || cmd.right != 0.0) result_.motor_time += kDt;
+  }
+  robot.stop();
+  const Time stop_time = rig_.clock().now();
+  while (rig_.clock().now() < stop_time + settle) tickAndMeasure(out);
+  return safe;
+}
+
+bool Procedure::steadyState(const std::vector<Sample>& s, Time from, Time to,
+                            double& v, double& omega) const {
+  std::vector<double> t, x, y, th;
+  for (const Sample& smp : s) {
+    if (smp.t < from || smp.t > to) continue;
+    // Cap "déroulé" : pas de saut de 2 pi entre deux mesures.
+    const double theta = th.empty() ? smp.pose.theta
+                                    : th.back() + wrapAngle(smp.pose.theta - th.back());
+    t.push_back(smp.t);
+    x.push_back(smp.pose.x);
+    y.push_back(smp.pose.y);
+    th.push_back(theta);
+  }
+  if (t.size() < 4) return false;
+  // Vitesse = pente de la position ; avance = projection sur le cap moyen.
+  const double vx = slope(t, x), vy = slope(t, y);
+  double mean_theta = 0.0;
+  for (double a : th) mean_theta += a / th.size();
+  v = vx * std::cos(mean_theta) + vy * std::sin(mean_theta);
+  omega = slope(t, th);
+  return true;
+}
+
+bool Procedure::rampDeadzone(bool left_wheel, double& u0) {
+  // Rampe u = 0.15 + 0.25 t sur une seule roue ; on s'arrête au premier mouvement.
+  const double u_start = 0.15, rate = 0.25, u_end = 0.8;
+  std::vector<Sample> samples;
+  for (int i = 0; i < 10; ++i) tickAndMeasure(samples);  // pose de repos
+  if (samples.empty()) return false;
+  const Pose2D rest = samples.back().pose;
+  ProtocolRobot& robot = rig_.robot();
+  const Time t0 = rig_.clock().now();
+  const double delay_guess = 0.05;
+  bool moved = false;
+  while (!moved) {
+    const double u = u_start + rate * (rig_.clock().now() - t0);
+    if (u > u_end) break;
+    robot.send(left_wheel ? WheelCmd{u, 0.0} : WheelCmd{0.0, u});
+    const std::size_t before = samples.size();
+    if (!tickAndMeasure(samples)) break;
+    result_.motor_time += kDt;
+    for (std::size_t i = before; i < samples.size(); ++i) {
+      const Pose2D& p = samples[i].pose;
+      if (std::hypot(p.x - rest.x, p.y - rest.y) > 0.006 ||
+          std::abs(wrapAngle(p.theta - rest.theta)) > degToRad(2.0)) {
+        // Commande en vigueur quand le mouvement a commencé (instant de capture - retard).
+        u0 = u_start + rate * (samples[i].t - delay_guess - t0);
+        moved = true;
+      }
+    }
+  }
+  robot.stop();
+  const Time stop = rig_.clock().now();
+  while (rig_.clock().now() < stop + 0.4) tickAndMeasure(samples);
+  return moved;
+}
+
+bool Procedure::rotateTo(double heading) {
+  // Rotation sur place avec le modèle actuel de robot.yaml (approximatif, suffisant ici).
+  const SimSetup& s = rig_.setup();
+  WheelMapper mapper(s.nav.wheel_mapper);
+  std::vector<Sample> samples;
+  const Time t0 = rig_.clock().now();
+  while (rig_.clock().now() < t0 + 6.0) {
+    if (!tickAndMeasure(samples)) break;
+    const double err = wrapAngle(heading - last_pose_.theta);
+    if (std::abs(err) < degToRad(4.0)) break;
+    rig_.robot().send(mapper.map({0.0, std::clamp(2.0 * err, -1.5, 1.5)}));
+    result_.motor_time += kDt;
+  }
+  rig_.robot().stop();
+  const Time stop = rig_.clock().now();
+  while (rig_.clock().now() < stop + 0.4) tickAndMeasure(samples);
+  return std::abs(wrapAngle(heading - last_pose_.theta)) < degToRad(8.0);
+}
+
+void Procedure::fitDynamics() {
+  // On cherche (d, tau) qui expliquent le mieux le déplacement mesuré pendant les échelons :
+  //   s(t') = v_ss (t' - d - tau (1 - exp(-(t' - d) / tau)))  pour t' = t - t_cmd > d, 0 sinon.
+  double best = 1e18;
+  for (double d = 0.0; d <= 0.25; d += 0.001) {
+    for (double tau = 0.02; tau <= 0.4; tau += 0.002) {
+      double err = 0.0;
+      for (const Step& st : steps_) {
+        const Pose2D& p0 = st.samples.front().pose;
+        const double c = std::cos(p0.theta), s = std::sin(p0.theta);
+        for (const Sample& smp : st.samples) {
+          const double tp = smp.t - st.t_cmd;
+          if (tp > 0.6) break;  // début de la réponse seulement
+          const double measured = (smp.pose.x - p0.x) * c + (smp.pose.y - p0.y) * s;
+          const double model = tp <= d ? 0.0 : st.v_ss * (tp - d - tau * (1.0 - std::exp(-(tp - d) / tau)));
+          err += (measured - model) * (measured - model);
+        }
+      }
+      if (err < best) {
+        best = err;
+        result_.delay = d;
+        result_.tau = tau;
+      }
+    }
+  }
+}
+
+MotorCalibrationResult Procedure::run() {
+  const double b = rig_.setup().robot.wheel_base;
+  log("Rappel : pile 9 V branchée (les moteurs ne tournent pas sur l'USB seul).");
+  std::vector<Sample> warmup;
+  for (int i = 0; i < 15; ++i) tickAndMeasure(warmup);
+  if (warmup.empty()) {
+    result_.error = "tag robot invisible : vérifiez la caméra et le tag 10";
+    return result_;
+  }
+
+  log("1) Rampes de zone morte (une roue à la fois)");
+  if (!rampDeadzone(true, result_.ramp_deadzone_left) || !rampDeadzone(false, result_.ramp_deadzone_right)) {
+    log("  (rampe incomplète : la zone morte viendra seulement des échelons)");
+  }
+  log("   gauche ~" + std::to_string(result_.ramp_deadzone_left) + ", droite ~" +
+      std::to_string(result_.ramp_deadzone_right));
+
+  log("2) Échelons avant / arrière");
+  const std::vector<double> levels = opt_.short_mode ? std::vector<double>{0.5, 0.7, 0.85, 1.0}
+                                                     : std::vector<double>{0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0};
+  const auto& arena = rig_.setup().arena;
+  for (double u : levels) {
+    // Face au grand côté de l'arène, pour avoir de la place.
+    const double heading = (arena.x_max - arena.x_min) >= (arena.y_max - arena.y_min) ? 0.0 : kPi / 2;
+    rotateTo(heading);
+    for (const double dir : {1.0, -1.0}) {
+      const double v_guess = 1.2 * wheelSpeedFromCommand(rig_.setup().robot.left, u) + 0.02;
+      const double room = availableDistance(last_pose_, dir) - 0.06;
+      const double duration = std::clamp(room / v_guess, 0.5, 1.5);
+      Step step;
+      step.direction = dir;
+      if (!drive({dir * u, dir * u}, duration, 0.4, step.samples, step.t_cmd)) continue;
+      double v = 0, omega = 0;
+      // Régime permanent : après ~4 tau (0.45 s), jusqu'à la fin de l'échelon.
+      if (!steadyState(step.samples, step.t_cmd + 0.45, step.t_cmd + duration, v, omega)) continue;
+      result_.left_samples.push_back({dir * u, v - omega * b / 2.0});
+      result_.right_samples.push_back({dir * u, v + omega * b / 2.0});
+      step.v_ss = v;
+      if (dir > 0 && duration >= 0.7) steps_.push_back(step);
+      log("   u = " + std::to_string(dir * u) + " : v = " + std::to_string(v) + " m/s, omega = " +
+          std::to_string(omega) + " rad/s");
+    }
+  }
+
+  log("3) Rotations sur place");
+  for (double u : opt_.short_mode ? std::vector<double>{0.6} : std::vector<double>{0.5, 0.7}) {
+    for (const double dir : {1.0, -1.0}) {
+      std::vector<Sample> s;
+      Time t_cmd = 0;
+      if (!drive({-dir * u, dir * u}, 1.2, 0.4, s, t_cmd)) continue;
+      double v = 0, omega = 0;
+      if (!steadyState(s, t_cmd + 0.45, t_cmd + 1.2, v, omega)) continue;
+      result_.left_samples.push_back({-dir * u, v - omega * b / 2.0});
+      result_.right_samples.push_back({dir * u, v + omega * b / 2.0});
+    }
+  }
+
+  log("4) Moindres carrés");
+  if (!fitMotor(result_.left_samples, result_.left) || !fitMotor(result_.right_samples, result_.right)) {
+    result_.error = "pas assez de mesures pour ajuster le modèle";
+    return result_;
+  }
+  fitDynamics();
+  result_.ok = true;
+  return result_;
+}
+
+}  // namespace
+
+bool fitMotor(const std::vector<WheelSample>& samples, MotorParams& out) {
+  // |v| = k |u| - k u0  : droite |v| = a |u| + c, d'où k = a et u0 = -c / a.
+  std::vector<double> u, v;
+  for (const WheelSample& s : samples) {
+    if (std::abs(s.v) > 0.01) {
+      u.push_back(std::abs(s.u));
+      v.push_back(std::abs(s.v));
+    }
+  }
+  if (u.size() < 3) return false;
+  const double a = slope(u, v);
+  double mean_u = 0, mean_v = 0;
+  for (std::size_t i = 0; i < u.size(); ++i) {
+    mean_u += u[i] / u.size();
+    mean_v += v[i] / v.size();
+  }
+  const double c = mean_v - a * mean_u;
+  if (a <= 0.0) return false;
+  out.gain = a;
+  out.deadzone = std::clamp(-c / a, 0.0, 0.9);
+  return true;
+}
+
+void writeMotorsToRobotYaml(const std::string& path, const MotorCalibrationResult& r) {
+  std::ifstream in(path);
+  std::vector<std::string> lines;
+  for (std::string line; std::getline(in, line);) lines.push_back(line);
+  // Parcours ligne à ligne : on sait dans quelle sous-section on est (motors, left, right).
+  std::string section, wheel;
+  auto setValue = [](std::string& line, double value) {
+    const std::size_t colon = line.find(':');
+    const std::size_t comment = line.find('#');
+    std::ostringstream v;
+    v << value;
+    std::string out = line.substr(0, colon + 1) + " " + v.str();
+    if (comment != std::string::npos) {
+      out.resize(std::max(out.size(), comment), ' ');
+      out += line.substr(comment);
+    }
+    line = out;
+  };
+  // robot.yaml : robot: (0) > motors: (2) > left/right: (4) > gain/deadzone (6) ; tau/delay (4).
+  for (std::string& line : lines) {
+    const std::size_t indent = line.find_first_not_of(' ');
+    if (indent == std::string::npos || line[indent] == '#') continue;
+    const std::string key = line.substr(indent, line.find(':') - indent);
+    if (indent <= 2) section = key;
+    if (section != "motors") continue;
+    if (indent == 4 && (key == "left" || key == "right")) wheel = key;
+    if (indent == 4 && key == "tau") setValue(line, r.tau);
+    if (indent == 4 && key == "delay") setValue(line, r.delay);
+    if (indent == 6 && key == "gain") setValue(line, wheel == "left" ? r.left.gain : r.right.gain);
+    if (indent == 6 && key == "deadzone") setValue(line, wheel == "left" ? r.left.deadzone : r.right.deadzone);
+  }
+  std::ofstream out(path);
+  for (const std::string& line : lines) out << line << "\n";
+}
+
+MotorCalibrationResult calibrateMotors(Rig& rig, const CameraModel& camera,
+                                       const MotorCalibrationOptions& options) {
+  Procedure procedure(rig, camera, options);
+  return procedure.run();
+}
