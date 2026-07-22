@@ -719,3 +719,392 @@ TEST(Smoother, ResampleSpacing) {
     EXPECT_LE((pts[i] - pts[i - 1]).norm(), 0.01 + 1e-9);
   }
   EXPECT_NEAR((pts.back() - Eigen::Vector2d(0.1, 0.055)).norm(), 0.0, 1e-12);
+}
+
+TEST(Smoother, CurvatureOfCircle) {
+  std::vector<Eigen::Vector2d> pts;
+  const double radius = 0.5;
+  for (int i = 0; i <= 100; ++i) {
+    const double a = i * 0.01;
+    pts.emplace_back(radius * std::cos(a), radius * std::sin(a));
+  }
+  const Path path = makePath(pts);
+  EXPECT_NEAR(path.points[50].curvature, 1.0 / radius, 1e-3);
+  EXPECT_NEAR(path.points[50].theta, wrapAngle(0.5 + kPi / 2), 1e-3);
+  EXPECT_NEAR(path.length(), radius * 1.0, 1e-3);
+}
+
+TEST(Smoother, LineOfSight) {
+  OccupancyGrid grid(0.0, 0.0, 20, 20, 1.0);
+  grid.set({10, 10}, CellState::Occupied);
+  InflationConfig none;
+  none.robot_radius = 0.0;
+  none.margin = 0.0;
+  none.d_max = 0.5;
+  const CostMap map(grid, none);
+  EXPECT_FALSE(lineOfSight(map, {0, 0}, {19, 19}));
+  EXPECT_TRUE(lineOfSight(map, {0, 0}, {19, 0}));
+}
+
+TEST(Smoother, NoSmoothedPointInLethalZoneOn200Maps) {
+  std::mt19937 rng(7);
+  PlannerConfig cfg;
+  int planned = 0;
+  for (int trial = 0; trial < 200; ++trial) {
+    const OccupancyGrid grid = randomBoxMap(100, 60, 0.01, 6, rng);
+    const CostMap map(grid, smallRobot());
+    const GridIndex s = randomFreeCell(map, rng);
+    const GridIndex g = randomFreeCell(map, rng);
+    if (s.col < 0 || g.col < 0) continue;
+    const Eigen::Vector2d sw = grid.cellToWorld(s);
+    const PlanResult res = planPath(map, {sw.x(), sw.y(), 0.0}, grid.cellToWorld(g), 0.0, cfg);
+    if (!res.ok()) continue;
+    ++planned;
+    for (const auto& p : res.path.points) {
+      ASSERT_FALSE(map.lethalAt(p.x, p.y)) << "essai " << trial;
+    }
+    const auto& last = res.path.points.back();
+    EXPECT_NEAR(last.x, grid.cellToWorld(g).x(), 1e-9);
+    EXPECT_NEAR(last.y, grid.cellToWorld(g).y(), 1e-9);
+  }
+  EXPECT_GT(planned, 100);
+}
+
+#ifdef NDEBUG
+TEST(Planner, Grid200x120PlansUnder5ms) {
+  std::mt19937 rng(11);
+  const OccupancyGrid grid = randomBoxMap(200, 120, 0.01, 8, rng);
+  const CostMap map(grid, smallRobot());
+  PlannerConfig cfg;
+  // Pire cas raisonnable : d'un coin à l'autre.
+  GridIndex s{5, 5}, g{194, 114};
+  nearestFreeCell(map, s, s);
+  nearestFreeCell(map, g, g);
+  const Eigen::Vector2d sw = grid.cellToWorld(s);
+  // Médiane de 20 essais : robuste aux pics de charge de la machine.
+  std::vector<double> times;
+  for (int i = 0; i < 20; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const PlanResult res = planPath(map, {sw.x(), sw.y(), 0.0}, grid.cellToWorld(g), {}, cfg);
+    times.push_back(
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    ASSERT_TRUE(res.ok());
+  }
+  std::sort(times.begin(), times.end());
+  const double ms = times[times.size() / 2];
+  std::cout << "planification 200x120 : " << ms << " ms (médiane)\n";
+  EXPECT_LT(ms, 5.0);
+}
+#endif
+
+namespace {
+PoseMeasurement measure(Time stamp, double x, double y, double theta, double sigma = 0.002) {
+  PoseMeasurement z;
+  z.stamp = stamp;
+  z.pose = {x, y, theta};
+  z.cov = Eigen::Vector3d(sigma * sigma, sigma * sigma, 0.01 * 0.01).asDiagonal();
+  return z;
+}
+}  // namespace
+
+TEST(Ekf, JacobianMatchesFiniteDifference) {
+  Vector5d x;
+  x << 0.3, -0.2, 0.7, 0.2, -0.5;
+  const double dt = 0.02, tau = 0.1;
+  const Matrix5d F = motionJacobian(x, dt, tau, tau);
+  const Twist2D u{0.25, 0.4};
+  for (int j = 0; j < 5; ++j) {
+    const double h = 1e-6;
+    Vector5d xp = x, xm = x;
+    xp(j) += h;
+    xm(j) -= h;
+    const Vector5d d = (motionModel(xp, u, dt, tau, tau) - motionModel(xm, u, dt, tau, tau)) / (2 * h);
+    for (int i = 0; i < 5; ++i) EXPECT_NEAR(F(i, j), d(i), 1e-6) << i << "," << j;
+  }
+}
+
+TEST(Ekf, InitializesOnFirstMeasurementThenGoesLost) {
+  Ekf ekf(EkfConfig{});
+  EXPECT_EQ(ekf.health(0.0), EkfHealth::Uninitialized);
+  EXPECT_TRUE(ekf.update(measure(0.0, 0.1, 0.2, 0.3), 0.0));
+  EXPECT_EQ(ekf.health(0.1), EkfHealth::Ok);
+  EXPECT_NEAR(ekf.pose().x, 0.1, 1e-12);
+  ekf.predict(0.7);
+  EXPECT_EQ(ekf.health(0.7), EkfHealth::Lost);
+}
+
+TEST(Ekf, GatingRejectsOutlier) {
+  Ekf ekf(EkfConfig{});
+  for (int i = 0; i < 10; ++i) {
+    ekf.predict(i * 0.033);
+    ekf.update(measure(i * 0.033, 0.5, 0.5, 0.0), i * 0.033);
+  }
+  ekf.predict(0.4);
+  EXPECT_FALSE(ekf.update(measure(0.4, 0.8, 0.5, 0.0), 0.4));  // saut de 30 cm
+  EXPECT_EQ(ekf.rejectedCount(), 1);
+  EXPECT_NEAR(ekf.pose().x, 0.5, 0.01);
+}
+
+// Robot qui roule tout droit à 0.2 m/s ; la caméra a 150 ms de retard.
+// Avec compensation, l'estimation colle à la vraie position ACTUELLE ; sans,
+// elle traîne derrière d'environ v * latence = 3 cm.
+double trackingErrorWithLatency(bool compensate) {
+  EkfConfig cfg;
+  cfg.latency_compensation = compensate;
+  cfg.cmd_delay = 0.0;
+  Ekf ekf(cfg);
+  const double v = 0.2, latency = 0.15, dt = 1.0 / 30;
+  double error = 0.0;
+  int n = 0;
+  for (int k = 0; k <= 90; ++k) {
+    const double t = k * dt;
+    ekf.addInput(t, {v, 0.0});
+    if (t >= latency) {
+      const double stamp = t - latency;
+      ekf.update(measure(stamp, v * stamp, 0.0, 0.0), t);
+    }
+    ekf.predict(t);
+    if (t > 2.0) {
+      error += std::abs(ekf.pose().x - v * t);
+      ++n;
+    }
+  }
+  return error / n;
+}
+
+TEST(Ekf, LatencyCompensationRemovesLag) {
+  const double with = trackingErrorWithLatency(true);
+  const double without = trackingErrorWithLatency(false);
+  EXPECT_LT(with, 0.003);
+  EXPECT_GT(without, 0.015);
+}
+
+TEST(Ekf, DelayedMeasurementEqualsImmediateOne) {
+  // Appliquer une mesure en retard (rejouée) ou à temps doit donner le même résultat.
+  EkfConfig cfg;
+  Ekf a(cfg), b(cfg);
+  for (Ekf* e : {&a, &b}) {
+    e->update(measure(0.0, 0.0, 0.0, 0.0), 0.0);
+    e->addInput(0.0, {0.2, 0.3});
+  }
+  // (instants < 0.5 s : au-delà sans mesure, le filtre passerait LOST et se réinitialiserait)
+  a.predict(0.3);
+  a.update(measure(0.3, 0.065, 0.006, 0.09), 0.3);
+  a.predict(0.45);
+  b.predict(0.3);
+  b.predict(0.45);
+  b.update(measure(0.3, 0.065, 0.006, 0.09), 0.45);
+  EXPECT_NEAR(a.pose().x, b.pose().x, 1e-9);
+  EXPECT_NEAR(a.pose().y, b.pose().y, 1e-9);
+  EXPECT_NEAR(a.pose().theta, b.pose().theta, 1e-9);
+}
+
+TEST(BatteryMonitor, AlertsWhenRobotIsTooSlow) {
+  for (const double real_ratio : {1.0, 0.5, 0.0}) {  // 0 = calé contre un mur : pas d'alerte
+    BatteryMonitor monitor(BatteryMonitorConfig{});
+    const double v_cmd = 0.2, dt = 1.0 / 30;
+    for (int k = 0; k < 150; ++k) {  // 5 s en ligne droite
+      const double t = k * dt;
+      monitor.update(t, {real_ratio * v_cmd * t, 0.0, 0.0}, {v_cmd, 0.0});
+    }
+    EXPECT_EQ(monitor.alert(), real_ratio > 0.2 && real_ratio < 0.7) << real_ratio;
+  }
+}
+
+// même du firmware), puis ProtocolRobot branché sur le firmware simulé.
+
+namespace {
+bool parse(const std::string& line, FwCommand& cmd) { return fwParseLine(line.c_str(), cmd); }
+}  // namespace
+
+// ------------------------------------------------------------ vecteurs connus
+TEST(Protocol, KnownVectors) {
+  EXPECT_EQ(encodeStop(), "S*53");
+  EXPECT_EQ(encodePing(0), "P,0*4C");
+  EXPECT_EQ(encodeMotor(100, -100, 7), "M,100,-100,7*7B");
+  EXPECT_EQ(encodeMotor(255, 255, 255), "M,255,255,255*53");
+}
+
+TEST(Protocol, FirmwareParsesWhatPcSends) {
+  FwCommand cmd;
+  ASSERT_TRUE(parse(encodeMotor(-37, 255, 200), cmd));
+  EXPECT_EQ(cmd.type, FW_MOTOR);
+  EXPECT_EQ(cmd.left, -37);
+  EXPECT_EQ(cmd.right, 255);
+  EXPECT_EQ(cmd.seq, 200);
+  ASSERT_TRUE(parse(encodeStop(), cmd));
+  EXPECT_EQ(cmd.type, FW_STOP);
+  ASSERT_TRUE(parse(encodePing(9), cmd));
+  EXPECT_EQ(cmd.type, FW_PING);
+  EXPECT_EQ(cmd.seq, 9);
+}
+
+TEST(Protocol, PcParsesWhatFirmwareSends) {
+  char out[FW_LINE_MAX];
+  fwFrame("A,42", out);
+  EXPECT_STREQ(out, "A,42*6B");
+  auto msg = parseRobotLine(out);
+  ASSERT_TRUE(msg);
+  EXPECT_EQ(msg->type, RobotMessage::Type::Ack);
+  EXPECT_EQ(msg->seq, 42);
+  EXPECT_EQ(parseRobotLine("W*57")->type, RobotMessage::Type::Watchdog);
+  EXPECT_EQ(parseRobotLine("B*42")->type, RobotMessage::Type::Boot);
+}
+
+// ------------------------------------------------------------ trames corrompues
+TEST(Protocol, FirmwareRejectsCorruptedFrames) {
+  FwCommand cmd;
+  EXPECT_FALSE(parse("M,100,-100,7*7C", cmd));       // mauvais checksum
+  EXPECT_FALSE(parse("M,100,-100,7*7b", cmd));       // minuscules
+  EXPECT_FALSE(parse("M,100,-100,7", cmd));          // pas de checksum
+  EXPECT_FALSE(parse("M,100,-100*" + std::string("00"), cmd));  // champ manquant
+  EXPECT_FALSE(parse(frame("M,256,0,1"), cmd));  // PWM hors bornes
+  EXPECT_FALSE(parse(frame("M,0,-256,1"), cmd));
+  EXPECT_FALSE(parse(frame("M,0,0,256"), cmd));  // seq hors bornes
+  EXPECT_FALSE(parse(frame("M,0,0,-1"), cmd));
+  EXPECT_FALSE(parse(frame("M,1a,0,1"), cmd));   // pas un nombre
+  EXPECT_FALSE(parse(frame("X,1"), cmd));        // commande inconnue
+  EXPECT_FALSE(parse(frame("S,1"), cmd));        // S sans argument
+  EXPECT_FALSE(parse("", cmd));
+  EXPECT_FALSE(parse("*00", cmd));
+  EXPECT_FALSE(parse(frame("M,00000001,0,1"), cmd));  // trop de chiffres
+  EXPECT_EQ(cmd.type, FW_NONE);
+}
+
+TEST(Protocol, FirmwareRejectsBufferOverflow) {
+  FwCommand cmd;
+  const std::string longest_valid = encodeMotor(-255, -255, 255);
+  EXPECT_LT(longest_valid.size(), static_cast<std::size_t>(FW_LINE_MAX));
+  EXPECT_TRUE(parse(longest_valid, cmd));
+  EXPECT_FALSE(parse(std::string(40, 'M'), cmd));
+}
+
+TEST(Protocol, PcRejectsCorruptedReplies) {
+  EXPECT_FALSE(parseRobotLine("A,42*6C"));
+  EXPECT_FALSE(parseRobotLine(frame("A,256")));
+  EXPECT_FALSE(parseRobotLine(frame("A,")));
+  EXPECT_FALSE(parseRobotLine(frame("Z")));
+  EXPECT_FALSE(parseRobotLine("garbage"));
+}
+
+TEST(Protocol, PwmConversion) {
+  EXPECT_EQ(toPwm(1.0), 255);
+  EXPECT_EQ(toPwm(-1.0), -255);
+  EXPECT_EQ(toPwm(2.0), 255);
+  EXPECT_EQ(toPwm(0.5), 128);
+  EXPECT_EQ(toPwm(0.0), 0);
+}
+
+// ------------------------------------------------------------ ProtocolRobot + SimFirmware
+namespace {
+struct SimLink {
+  SimWorld world{[] {
+    SimWorldConfig c;
+    c.arena.x_min = c.arena.y_min = -5;
+    c.arena.x_max = c.arena.y_max = 5;
+    return c;
+  }()};
+  SimClock clock;
+  SimFirmware firmware{world, clock};
+};
+}  // namespace
+
+TEST(ProtocolRobot, DrivesSimulatedRobotThroughProtocol) {
+  SimLink link;
+  ProtocolRobot robot(link.firmware, link.clock, {});
+  EXPECT_TRUE(robot.waitReady());
+  for (int i = 0; i < 60; ++i) {
+    link.clock.advance(1.0 / 30);
+    link.world.advanceTo(link.clock.now());
+    robot.send({0.8, 0.8});
+    robot.poll();
+  }
+  EXPECT_GT(link.world.groundTruthPose().x, 0.2);  // le robot a avancé
+  EXPECT_GE(robot.lastRoundTrip(), 0.0);           // les acquittements reviennent
+  EXPECT_EQ(link.firmware.invalidFrames(), 0);
+}
+
+TEST(ProtocolRobot, WatchdogStopsRobotWhenPcGoesSilent) {
+  SimLink link;
+  ProtocolRobot robot(link.firmware, link.clock, {});
+  robot.waitReady();
+  robot.send({1.0, 1.0});
+  link.clock.advance(0.2);
+  link.world.advanceTo(link.clock.now());
+  EXPECT_FALSE(link.firmware.watchdogFired());
+  // Le PC ne renvoie plus rien (câble débranché, programme planté) pendant 0,4 s.
+  link.clock.advance(0.4);
+  link.world.advanceTo(link.clock.now());
+  robot.poll();  // lit la trame W ; renvoie aussi une commande, mais trop tard
+  EXPECT_EQ(robot.watchdogCount(), 1);
+  EXPECT_TRUE(link.firmware.validFrames() > 1);
+}
+
+TEST(ProtocolRobot, ResendKeepsWatchdogFed) {
+  SimLink link;
+  ProtocolRobot robot(link.firmware, link.clock, {});
+  robot.waitReady();
+  robot.send({0.6, 0.6});
+  for (int i = 0; i < 100; ++i) {  // 2 s à 50 Hz, sans nouvelle consigne
+    link.clock.advance(0.02);
+    robot.poll();
+  }
+  EXPECT_EQ(robot.watchdogCount(), 0);
+  EXPECT_FALSE(link.firmware.watchdogFired());
+}
+
+TEST(ProtocolRobot, DestructorSendsStop) {
+  SimLink link;
+  {
+    ProtocolRobot robot(link.firmware, link.clock, {});
+    robot.waitReady();
+    robot.send({1.0, 1.0});
+  }
+  // Après l'arrêt, le robot simulé ralentit jusqu'à 0.
+  link.clock.advance(1.0);
+  link.world.advanceTo(link.clock.now());
+  EXPECT_NEAR(link.world.groundTruthTwist().v, 0.0, 1e-3);
+}
+
+TEST(Episode, BasicScenariosSucceedWithNonIdealMotors) {
+  const std::string dir = std::string(RN_SOURCE_DIR) + "/config";
+  const SimSetup setup = loadSimSetup(dir);
+  const auto scenarios = loadScenarios(dir + "/scenarios/basic.yaml", 0.06);
+  ASSERT_EQ(scenarios.size(), 20u);
+  EpisodeOptions options;
+  for (const auto& sc : {scenarios[1], scenarios[9], scenarios[14]}) {
+    const EpisodeMetrics m = runEpisode(setup, sc, options);
+    EXPECT_TRUE(m.success) << sc.name << " : " << m.failure;
+    EXPECT_EQ(m.collisions, 0) << sc.name;
+    EXPECT_LT(m.final_position_error, 0.02) << sc.name;
+  }
+}
+
+TEST(Episode, UnreachableGoalIsReportedNotCrashed) {
+  const std::string dir = std::string(RN_SOURCE_DIR) + "/config";
+  const SimSetup setup = loadSimSetup(dir);
+  Scenario sc;
+  sc.name = "mur";
+  sc.start = {0.2, 0.35, 0.0};
+  sc.goal = {0.8, 0.35};
+  sc.obstacles.push_back({0.5, 0.35, 0.05, 0.7, 0.06, 0.0, "red"});  // mur sur toute la largeur
+  const EpisodeMetrics m = runEpisode(setup, sc, {});
+  EXPECT_FALSE(m.success);
+  EXPECT_NE(m.failure.find("PAS_DE_CHEMIN"), std::string::npos) << m.failure;
+}
+
+TEST(UdpTransport, SendsOneLinePerPacket) {
+  // Récepteur UDP local qui joue le rôle du module Wi-Fi.
+  const int receiver = ::socket(AF_INET, SOCK_DGRAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(47321);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(::bind(receiver, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+  UdpTransport udp("127.0.0.1", 47321);
+  ASSERT_TRUE(udp.writeLine(encodeMotor(100, -100, 7)));
+  char buffer[64] = {0};
+  const ssize_t n = ::recv(receiver, buffer, sizeof(buffer) - 1, 0);
+  ::close(receiver);
+  EXPECT_EQ(std::string(buffer, n), "M,100,-100,7*7B\n");
+}
