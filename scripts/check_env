@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Vérifie toute l'installation. Chaque ligne affiche [OK], [!!] (erreur) ou [--] (facultatif absent).
+#
+#   scripts/check_env                 # tout sauf la caméra
+#   scripts/check_env --camera 0      # + ouverture de la caméra d'index 0
+#   scripts/check_env --camera http://192.168.1.20:8080/video   # + flux réseau
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CAMERA=""
+[[ "${1:-}" == "--camera" ]] && CAMERA="${2:-0}"
+
+# Sur Mac Apple Silicon : Homebrew natif en premier dans le PATH.
+[[ -d /opt/homebrew/bin ]] && export PATH="/opt/homebrew/bin:$PATH"
+PREFIXES="/opt/homebrew;$HOME/.local;${CMAKE_PREFIX_PATH:-}"
+
+FAILED=0
+ok()   { printf '\033[32m[OK]\033[0m %s\n' "$*"; }
+bad()  { printf '\033[31m[!!]\033[0m %s\n' "$*"; FAILED=1; }
+skip() { printf '\033[33m[--]\033[0m %s\n' "$*"; }
+
+version_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]; }
+
+echo "Système : $(uname -s) $(uname -r) $(uname -m)"
+
+# --- outils de compilation
+if command -v c++ >/dev/null; then ok "compilateur : $(c++ --version | head -1)"; else bad "compilateur C++ absent"; fi
+if command -v cmake >/dev/null; then
+  v="$(cmake --version | head -1 | awk '{print $3}')"
+  if version_ge "$v" 3.20; then ok "cmake $v"; else bad "cmake $v < 3.20"; fi
+else bad "cmake absent"; fi
+if command -v ninja >/dev/null; then ok "ninja $(ninja --version)"; else bad "ninja absent"; fi
+if command -v git >/dev/null; then ok "$(git --version)"; else bad "git absent"; fi
+
+# --- OpenCV + ArUco + Eigen + yaml-cpp : on compile un vrai petit programme
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+cat > "$WORK/CMakeLists.txt" <<'EOF'
+cmake_minimum_required(VERSION 3.20)
+project(check_env CXX)
+set(CMAKE_CXX_STANDARD 17)
+find_package(OpenCV REQUIRED)
+if(OpenCV_VERSION VERSION_LESS 4.7)
+  message(FATAL_ERROR "OpenCV ${OpenCV_VERSION} trop ancien (4.7 minimum, nouvelle API ArUco)")
+endif()
+find_package(Eigen3 REQUIRED NO_MODULE)
+find_package(yaml-cpp REQUIRED)
+add_executable(check_env main.cpp)
+target_link_libraries(check_env opencv_core opencv_imgproc opencv_videoio opencv_objdetect Eigen3::Eigen yaml-cpp::yaml-cpp)
+EOF
+cat > "$WORK/main.cpp" <<'EOF'
+#include <Eigen/Core>
+#include <iostream>
+#include <opencv2/objdetect/aruco_detector.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
+#include <yaml-cpp/yaml.h>
+int main(int argc, char** argv) {
+  std::cout << "OpenCV " << CV_VERSION << ", Eigen " << EIGEN_WORLD_VERSION << "."
+            << EIGEN_MAJOR_VERSION << "\n";
+  // Génère le tag 10, le pose sur un fond blanc et vérifie qu'on le retrouve.
+  const auto dict = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50);
+  cv::Mat tag, img(400, 400, CV_8UC1, cv::Scalar(255));
+  cv::aruco::generateImageMarker(dict, 10, 200, tag);
+  tag.copyTo(img(cv::Rect(100, 100, 200, 200)));
+  cv::aruco::ArucoDetector detector(dict);
+  std::vector<std::vector<cv::Point2f>> corners;
+  std::vector<int> ids;
+  detector.detectMarkers(img, corners, ids);
+  if (ids.size() != 1 || ids[0] != 10) { std::cout << "ARUCO_FAIL\n"; return 1; }
+  std::cout << "ARUCO_OK\n";
+  if (argc > 1) {
+    const std::string src = argv[1];
+    cv::VideoCapture cap;
+    if (src.find_first_not_of("0123456789") == std::string::npos) cap.open(std::stoi(src));
+    else cap.open(src);
+    cv::Mat frame;
+    if (!cap.isOpened() || !cap.read(frame) || frame.empty()) { std::cout << "CAMERA_FAIL\n"; return 2; }
+    std::cout << "CAMERA_OK " << frame.cols << "x" << frame.rows << "\n";
+  }
+  return 0;
+}
+EOF
+if cmake -S "$WORK" -B "$WORK/build" -G Ninja -DCMAKE_PREFIX_PATH="$PREFIXES" >"$WORK/cmake.log" 2>&1 \
+   && cmake --build "$WORK/build" >>"$WORK/cmake.log" 2>&1; then
+  out="$("$WORK/build/check_env" ${CAMERA:+"$CAMERA"} 2>&1)"
+  ok "$(echo "$out" | head -1) (Eigen et yaml-cpp trouvés)"
+  if echo "$out" | grep -q ARUCO_OK; then ok "détection ArUco (nouvelle API ArucoDetector)"; else bad "détection ArUco"; fi
+  if [[ -n "$CAMERA" ]]; then
+    if echo "$out" | grep -q CAMERA_OK; then ok "caméra '$CAMERA' : $(echo "$out" | grep CAMERA_OK | cut -d' ' -f2)"
+    else bad "caméra '$CAMERA' impossible à ouvrir (sur Mac : autoriser le Terminal dans Réglages > Confidentialité > Caméra)"; fi
+  else
+    skip "caméra non testée (relancer avec --camera 0 quand l'iPhone est installé)"
+  fi
+else
+  bad "compilation OpenCV + ArUco + Eigen + yaml-cpp impossible :"
+  grep -iE "error|could not find|not found" "$WORK/cmake.log" | head -5 | sed 's/^/      /'
+fi
+
+# --- Arduino
+if command -v arduino-cli >/dev/null; then
+  ok "arduino-cli $(arduino-cli version | awk '{print $3}')"
+  if arduino-cli core list 2>/dev/null | grep -q '^arduino:avr'; then ok "cœur arduino:avr installé"
+  else bad "cœur arduino:avr absent : arduino-cli core install arduino:avr"; fi
+  # Seuls les vrais ports USB série (pas les casques Bluetooth, qui apparaissent aussi).
+  ports="$(arduino-cli board list 2>/dev/null | awk '{print $1}' | grep -E 'usbserial|usbmodem|wchusb|ttyUSB|ttyACM|^COM[0-9]' | tr '\n' ' ')"
+  if [[ -n "$ports" ]]; then ok "carte détectée sur : $ports"; else skip "aucune carte branchée (normal si le robot n'est pas relié)"; fi
+else
+  bad "arduino-cli absent"
+fi
+
+# --- Python pour les courbes
+if [[ -x "$ROOT/.venv/bin/python" ]] && "$ROOT/.venv/bin/python" -c "import matplotlib, numpy" 2>/dev/null; then
+  ok "Python .venv avec matplotlib et numpy"
+else
+  bad "Python .venv absent : python3 -m venv .venv && .venv/bin/pip install matplotlib numpy"
+fi
+
+echo
+if [[ $FAILED -eq 0 ]]; then printf '\033[32mTout est au vert.\033[0m\n'; else printf '\033[31mAu moins un point est à corriger.\033[0m\n'; fi
+exit $FAILED
