@@ -110,3 +110,79 @@ control:
     sigma_v: 0.08             # bruit d'échantillonnage sur v (m/s)
     sigma_omega: 1.0          # bruit d'échantillonnage sur omega (rad/s)
     lambda: 1.0               # température
+    w_path: 300.0             # distance au chemin (au carré)
+    w_obstacle: 0.3           # coût d'inflation (faible : le chemin évite déjà les obstacles)
+    w_dcmd: 0.5               # à-coups de commande
+    w_heading: 1.0            # erreur de cap / chemin
+    w_speed: 50.0             # dépassement de la vitesse de référence
+    w_terminal: 100.0         # distance au point visé en fin d'horizon
+    v_min: -0.05              # petite marche arrière autorisée (m/s)
+    handover_distance: 0.08   # sous 8 cm du but, Pure Pursuit termine l'approche (m)
+    seed: 7                   # graine du tirage (exécutions reproductibles)
+
+  wheel_mapper:
+    min_wheel_speed: 0.03     # vitesse de roue minimale fiable (m/s)
+    start_speed: 0.015        # roue arrêtée : démarre au-dessus de ce seuil (m/s)
+    stop_speed: 0.006         # roue en marche : s'arrête sous ce seuil (m/s)
+    min_command: 0.28         # vrai robot : en dessous, une roue lancée cale
+    kick_command: 0.38        # vrai robot : il faut ça pour qu'une roue arrêtée démarre...
+    kick_cycles: 4            # ... pendant 4 cycles (~0,13 s)
+
+estimation:
+  cmd_delay: 0.05             # retard entre la consigne et son effet (s) ; en réel : + liaison série
+  process_noise:              # variances ajoutées par seconde
+    xy: 1.0e-5
+    theta: 1.0e-4
+    v: 2.0                    # fort : la vitesse est surtout apprise des mesures, car le
+    omega: 20.0               # vrai moteur diffère du modèle (zones mortes, gains)
+  initial_std:                # incertitude à l'initialisation
+    xy: 0.01                  # (m)
+    theta_deg: 5
+    v: 0.05                   # (m/s)
+    omega: 0.2                # (rad/s)
+  gate_chi2: 11.34            # gating de Mahalanobis : chi2 à 3 ddl, 99 %
+  buffer_duration: 2.0        # profondeur du tampon pour la compensation de latence (s)
+  lost_timeout: 0.5           # pas de mesure acceptée depuis ce temps -> LOST, arrêt (s)
+  latency_compensation: true  # false = ablation (mesure traitée comme actuelle)
+  max_rejections_before_reset: 15
+
+  battery:
+    ratio: 0.7                # alerte si vitesse mesurée < 70 % de la vitesse prévue...
+    stall_ratio: 0.2          # ... mais > 20 % (sinon le robot est calé contre un obstacle)
+    duration: 3.0             # ... pendant plus de 3 s cumulées
+    window: 0.5               # fenêtre de mesure de la vitesse (s)
+    min_speed: 0.05           # on ne juge que les consignes assez rapides (m/s)
+    max_turn_rate: 1.2        # ... et presque droites : sur 0,5 s, la corde vaut encore 98 % de l'arc (rad/s)
+
+perception:
+  localizer:
+    method: A                 # A = rayons + plan + Kabsch 2D ; B = solvePnP IPPE_SQUARE
+    size_tolerance: 0.10      # rejet si la taille du tag reconstruite s'écarte de plus de 10 %
+    sigma_xy: 0.003           # écart-type de base de la position mesurée (m)
+    sigma_theta_deg: 1.0      # écart-type de base du cap mesuré
+    residual_scale: 0.002     # un résidu de 2 mm double les écarts-types (m)
+
+  obstacles:
+    morph_kernel: 5           # noyau d'ouverture / fermeture (px)
+    min_area_px: 150          # taches plus petites ignorées
+    frames: 20                # vote majoritaire sur 20 images au démarrage
+    robot_mask_radius: 0.13   # zone masquée autour du robot (m)
+
+  charuco:                    # plateau de calibration de la caméra (gen_markers, calib_camera)
+    squares_x: 5
+    squares_y: 7
+    square_mm: 33.25          # côté d'une case imprimée (impression à 95 % : 33,25 au lieu de 35)
+    marker_mm: 24.7           # côté du tag dans une case (95 % de 26)
+
+hardware:
+  camera_source: "0"          # caméra : index ("0", "1"...) ou URL d'un flux ; iPhone = Caméra de continuité
+  camera_width: 1920          # OpenCV ne donne que du 16:9 ; en 0.5x, les 4 tags rentrent
+  camera_height: 1080
+  camera_latency: 0.15        # retard de l'image (s), mesuré par "camera_tool latency --write"
+  link: wifi                  # liaison avec le robot : wifi ou serial (câble USB)
+  robot_ip: "192.168.4.1"     # IP du robot : 192.168.4.1 quand il crée son réseau "robot_nav"
+  udp_port: 4210
+  serial_port: auto           # "auto" = premier port USB série trouvé, sinon ex. /dev/cu.usbmodem1101
+  serial_baud: 115200
+  resend_rate: 25.0           # renvoi de la commande pour nourrir le watchdog (Hz)
+  ready_timeout: 8.0          # attente de la trame "B" après ouverture du port (s) ; la carte prépare le Wi-Fi ~5 s
