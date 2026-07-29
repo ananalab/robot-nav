@@ -1,0 +1,33 @@
+#!/bin/bash
+# Séries d'essais sur le vrai robot : 5 buts enchaînés, chacun affiché et filmé.
+# Après chaque série, le robot revient seul au milieu de la zone (retour non compté).
+#   scripts/real_trials pp mppi   (les deux séries à la suite)
+#   scripts/real_trials mppi      (une seule)
+# Dans la fenêtre : ESPACE = arrêt d'urgence. Ctrl+C arrête tout.
+# Résumé de chaque série dans runs/essais_<contrôleur>_<date>.txt
+set -u
+cd "$(dirname "$0")/.."
+mkdir -p runs
+# Carrés rouges (centres, en m) : (0,32 ; 0,27), (0,73 ; 0,71), (1,07 ; 0,32).
+goals=("0.11,0.11" "1.12,0.64" "0.24,0.62" "1.21,0.11" "0.69,0.33")
+middle="0.665,0.425"
+
+build=build; [ -d build.nosync ] && build=build.nosync  # dossier de compilation
+
+go() {  # go <contrôleur> <but>
+  ./$build/robot_nav --mode real --auto-quit --record --controller "$1" \
+    --goal "$2" --timeout 40 2>&1 | grep -E "Exécution|État final|Pose estimée|Fin"
+}
+
+for ctrl in "${@:-pp}"; do
+  out="runs/essais_${ctrl}_$(date +%Y%m%d_%H%M%S).txt"
+  for goal in "${goals[@]}"; do
+    echo "== but $goal ($ctrl)" | tee -a "$out"
+    go "$ctrl" "$goal" | tee -a "$out"
+    sleep 2
+  done
+  echo "Résumé : $out"
+  echo "Retour au milieu..."
+  go "$ctrl" "$middle" > /dev/null
+  sleep 2
+done
