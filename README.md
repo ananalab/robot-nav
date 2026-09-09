@@ -26,3 +26,47 @@ Real robot, 3 flat red obstacles, 5 chained goals (videos: [Pure Pursuit](docs/m
 | MPPI | 5 / 5 | 1.0 / 1.1 cm | 7.6 s | 0 |
 
 Simulation, 5 seeds per scenario, camera rendering and EKF in the loop:
+
+| Scenarios | Controller | Goal reached (2 cm, no collision) | Collisions |
+|---|---|---|---|
+| 20 random, 0–2 obstacles | Pure Pursuit | 90 / 100 | 8 |
+| | MPPI | 100 / 100 | 0 |
+| 9 narrow passages | Pure Pursuit | 26 / 45 | 14 |
+| | MPPI | 43 / 45 | 0 |
+
+Details: [docs/results.md](docs/results.md). Hardware: [docs/hardware.md](docs/hardware.md).
+
+## Build
+
+```bash
+scripts/install_deps.sh        # macOS (Homebrew); Linux without root: --local
+cmake -B build -G Ninja -DCMAKE_PREFIX_PATH=/opt/homebrew
+cmake --build build
+ctest --test-dir build         # 85 tests
+```
+
+Dependencies: OpenCV 4/5, Eigen, yaml-cpp, GoogleTest (fetched), arduino-cli for the firmware.
+
+## Usage
+
+| Command | |
+|---|---|
+| `build/robot_nav --mode sim --realtime` | simulator; click a goal, drag for a heading, `c` switches controller |
+| `build/robot_nav --mode real` | real robot |
+| `build/bench --suite basic --mode full --controller mppi --seeds 5` | simulated benchmark |
+| `scripts/real_trials pp mppi` | real-robot trial series, recorded |
+| `build/camera_tool calib` / `arena --real` | camera intrinsics / floor pose |
+| `build/robot_tool calib --real` | motor identification |
+| `build/robot_tool check --wheels` / `teleop --real` | link test / keyboard driving |
+| `scripts/flash_firmware` | firmware upload |
+
+## Layout
+
+| Path | |
+|---|---|
+| `src/` | core, vision, estimation, planning, control, simulation, hardware link, application |
+| `apps/` | `robot_nav`, `bench`, `robot_tool`, `camera_tool` |
+| `tests/` | GoogleTest unit and closed-loop tests |
+| `config/` | robot and arena (`robot.yaml`), parameters (`params.yaml`), benchmark scenarios |
+| `firmware/` | Arduino firmware and hardware test sketches |
+| `docs/` | hardware, results, media |
