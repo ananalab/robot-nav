@@ -18,7 +18,7 @@ Camera-guided navigation for a self-built two-wheeled robot, written from scratc
 
 ## Results
 
-Real robot, 3 flat red obstacles, 5 chained goals (videos: [Pure Pursuit](docs/media/real_pp.mp4), [MPPI](docs/media/real_mppi.mp4)):
+Real robot, 3 flat red obstacles, 5 chained goals (videos: [Pure Pursuit](docs/media/real_pp.mp4), [MPPI](docs/media/real_mppi.mp4); same layout in simulation: [MPPI](docs/media/sim_mppi.mp4)):
 
 | Controller | Goals reached | Final error (median / max) | Time per goal (median) | Obstacle contacts |
 |---|---|---|---|---|

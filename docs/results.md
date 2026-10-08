@@ -19,7 +19,7 @@ Three flat red obstacles, five chained goals per controller, robot pose measured
 | Goals reached | 5 / 5 | 5 / 5 |
 | Obstacle contacts (robot disc over a sheet) | 2, up to 2.7 cm | 0, smallest clearance 0.3 cm |
 
-Videos: [Pure Pursuit](media/real_pp.mp4), [MPPI](media/real_mppi.mp4).
+Videos: [Pure Pursuit](media/real_pp.mp4), [MPPI](media/real_mppi.mp4). Same goals and obstacles in the simulator: [MPPI](media/sim_mppi.mp4).
 
 ## Simulation
 
